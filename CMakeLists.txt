@@ -14,15 +14,12 @@ qt_standard_project_setup(REQUIRES 6.5)
 
 qt_add_executable(appKaZa
     src/main.cpp
-)
-
-set(SOURCES
-        src/KazaApplicationManager.h	src/KazaApplicationManager.cpp
-        src/kzobject.h                  src/kzobject.cpp
-        src/kzhistory.h                 src/kzhistory.cpp
-        src/kazaobject.h                src/kazaobject.cpp
-        src/dbquery.h                   src/dbquery.cpp
-        protocol/kazaprotocol.h         protocol/kazaprotocol.cpp
+    src/KazaApplicationManager.h	src/KazaApplicationManager.cpp
+    src/kzobject.h                  src/kzobject.cpp
+    src/kzhistory.h                 src/kzhistory.cpp
+    src/kazaobject.h                src/kazaobject.cpp
+    src/dbquery.h                   src/dbquery.cpp
+    protocol/kazaprotocol.h         protocol/kazaprotocol.cpp
 )
 
 file(GLOB_RECURSE AndroidFiles "${CMAKE_CURRENT_SOURCE_DIR}/Android")
@@ -33,11 +30,14 @@ set_source_files_properties(
   HEADER_FILE_ONLY TRUE
 )
 
-qt_add_qml_module(appKaZa
-    URI KaZa
-    VERSION 1.0
-        SOURCES ${SOURCES} ${KAZAIFACE_SRC} ${AndroidFiles}
-        QML_FILES qml/Main.qml qml/Configuration.qml qml/Homepage.qml qml/ForceInstall.qml qml/KazaSettings.qml
+qt_add_resources(appKaZa "KaZa"
+    PREFIX "/"
+    FILES
+        qml/Main.qml
+        qml/Configuration.qml
+        qml/Homepage.qml
+        qml/ForceInstall.qml
+        qml/KazaSettings.qml
 )
 
 target_include_directories(appKaZa PUBLIC protocol/)

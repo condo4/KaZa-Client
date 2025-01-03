@@ -3,6 +3,7 @@
 #include <QQmlContext>
 #include <QStandardPaths>
 #include <QQuickStyle>
+#include <QDirIterator>
 #include "KazaApplicationManager.h"
 #include "kzobject.h"
 #include "kzhistory.h"
@@ -32,7 +33,7 @@ int main(int argc, char *argv[])
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
         &app, []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
-    engine.loadFromModule("KaZa", "Main");
+    engine.load("qrc:/qml/Main.qml");
 
     manager.setShow(true);
 

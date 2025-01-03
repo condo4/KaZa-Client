@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
-import KaZa
 
 ApplicationWindow {
     id: mainwindow
