@@ -14,6 +14,10 @@ ApplicationWindow {
     property bool configured: manager ? manager.configured : false
     property string homepage: (manager && manager.show) ? manager.homepage : "Homepage.qml"
 
+    Component.onCompleted: {
+        manager.applicationReday()
+    }
+
     StackView {
         id: stackView
         anchors.fill: parent

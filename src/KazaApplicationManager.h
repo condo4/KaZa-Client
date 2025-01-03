@@ -35,7 +35,6 @@ class KazaApplicationManager : public QObject
     QString m_appFile;
     QString m_appWanted;
 
-
     bool m_debug {true};
     bool m_configured {false};
     bool m_inline;
@@ -75,6 +74,7 @@ public slots:
     bool setConfiguration(QString host, uint16_t port, QString clientPassword, QString username);
     void suspend();
     void resume();
+    void applicationReday();
 
 private slots:
     void _encrypted();

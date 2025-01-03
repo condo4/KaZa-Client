@@ -19,6 +19,10 @@
 
 #include "kazaobject.h"
 
+#ifdef ANDROID
+    #include <QtCore/private/qandroidextras_p.h>
+#endif
+
 KazaApplicationManager *KazaApplicationManager::m_instance = nullptr;
 
 
@@ -201,6 +205,19 @@ void KazaApplicationManager::resume()
         */
         qDebug() << "TODO: Restore Object link";
     }
+}
+
+void KazaApplicationManager::applicationReday()
+{
+    qDebug() << "Application ready";
+#ifdef ANDROID
+    auto activity = QJniObject(QNativeInterface::QAndroidApplication::context());
+    QAndroidIntent serviceIntent(activity.object(), "org/kaza/LocalService");
+    QJniObject result = activity.callObjectMethod(
+        "startService",
+        "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+        serviceIntent.handle().object());
+#endif
 }
 
 void KazaApplicationManager::_encrypted()
