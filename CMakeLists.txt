@@ -28,6 +28,7 @@ qt_add_executable(KaZa
     src/kzhistory.h                 src/kzhistory.cpp
     src/kazaobject.h                src/kazaobject.cpp
     src/dbquery.h                   src/dbquery.cpp
+    src/kzport.h                    src/kzport.cpp
     protocol/kazaprotocol.h         protocol/kazaprotocol.cpp
     ${PLATFORM_FILES}
 )
