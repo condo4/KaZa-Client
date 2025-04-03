@@ -8,9 +8,9 @@ set(VERSION_CODE 240926)
 add_definitions("-DVERSION_CODE=${VERSION_CODE}")
 add_definitions("-DVERSION_NAME=${CMAKE_PROJECT_VERSION}")
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Quick QuickControls2 Network Charts Xml)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Quick QuickControls2 Network Charts Xml WebView)
 
-qt_standard_project_setup(REQUIRES 6.5)
+qt_standard_project_setup(REQUIRES 6.8)
 
 if(ANDROID)
     set(PLATFORM_FILES
@@ -46,7 +46,7 @@ qt_add_resources(KaZa "KaZa"
 target_include_directories(KaZa PUBLIC protocol/)
 
 target_link_libraries(KaZa
-    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Charts Qt6::Xml Qt6::CorePrivate
+    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Charts Qt6::Xml Qt6::CorePrivate Qt6::WebView
 )
 
 if (ANDROID)

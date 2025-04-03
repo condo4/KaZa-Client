@@ -8,6 +8,7 @@
 #include "kzobject.h"
 #include "kzhistory.h"
 #include "kzport.h"
+#include <QtWebView>
 
 #define xstr(s) str(s)
 #define str(s) #s
@@ -15,6 +16,7 @@
 
 int main(int argc, char *argv[])
 {
+    QtWebView::initialize();
     QString version(VERSION);
     qInfo().noquote() << "KaZa " << version;
     QApplication app(argc, argv);
