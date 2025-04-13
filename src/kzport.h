@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QQmlParserStatus>
 #include <QTcpServer>
+#include <QMap>
 
 class KaZaProtocol;
 

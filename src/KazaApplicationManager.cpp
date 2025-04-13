@@ -19,12 +19,13 @@
 
 #include "kazaobject.h"
 
+
 #ifdef ANDROID
     #include <QtCore/private/qandroidextras_p.h>
+    #include <jni.h>
 #endif
 
 KazaApplicationManager *KazaApplicationManager::m_instance = nullptr;
-
 
 KazaApplicationManager::KazaApplicationManager(QObject *parent)
     : QObject{parent}
@@ -179,31 +180,25 @@ bool KazaApplicationManager::setConfiguration(QString host,
 
 void KazaApplicationManager::suspend()
 {
-    /* TODO: Restore after work
     m_ssl.disconnectFromHost();
     m_ssl.waitForDisconnected();
-    */
 }
 
 void KazaApplicationManager::resume()
 {
-    //qDebug() << "Resume";
+    qDebug() << "Resume";
     if(!m_ssl.isEncrypted())
     {
         m_ssl.connectToHostEncrypted(m_host, m_port);
         m_ssl.waitForConnected();
-        /*
-        for(const QString &key: m_knxmap.keys())
+
+        for(KaZaObject *obj: m_instance->m_kobjects)
         {
-            if(m_knxmap[key].size())
+            if(obj->refcount())
             {
-                uint16_t gad = m_knxgad[key];
-                m_packets->sendKnxSubscription(1, gad);
-                emit paramRecived(key);
+                m_protocol.sendCommand("OBJ:" + obj->name() + ":" + QString::number(m_instance->m_kobjects.indexOf(obj)));
             }
         }
-        */
-        qDebug() << "TODO: Restore Object link";
     }
 }
 
@@ -223,6 +218,7 @@ void KazaApplicationManager::applicationReday()
 void KazaApplicationManager::_encrypted()
 {
     qInfo().noquote() << "KaZa is connected";
+
     m_ready = true;
     m_secured = true;
     emit readyChanged();
@@ -230,11 +226,6 @@ void KazaApplicationManager::_encrypted()
     emit connectedChanged(m_ssl.isEncrypted());
     m_protocol.sendCommand("USER:" + m_settings.value("username").toString());
 }
-
-
-
-
-
 
 void KazaApplicationManager::_startApplication()
 {
@@ -314,8 +305,6 @@ bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const 
 
 void KazaApplicationManager::__appStateChange(Qt::ApplicationState state)
 {
-    qDebug() << "KnxCachedIface: Application state change" << state;
-
     if(state == Qt::ApplicationInactive)
     {
         suspend();
@@ -385,6 +374,7 @@ KaZaObject *KazaApplicationManager::getKaZaObject(const QString &name) {
     obj->setName(name);
     obj->get();
     m_instance->m_kobjects.append(obj);
+
 #ifdef DEBUG_OBJLIFECYCLE
     qDebug() << "KaZaObject: Create a new object " << m_instance->m_kobjects.indexOf(obj) << " for " << name;
 #endif
