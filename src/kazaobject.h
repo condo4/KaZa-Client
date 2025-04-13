@@ -27,17 +27,19 @@ public:
     void kzRegister(KzObject* kzobject);
     void kzUnregister(KzObject* kzobject);
 
-    void changeRequest(QVariant newValue);
+    void changeRequest(QVariant newValue, bool confirm=false);
     void refresh();
 
     void put();
     void get();
 
+    quint32 refcount() const;
+
 signals:
     void valueChanged();
     void nameChanged();
     void unitChanged();
-    void changeRequested(QVariant value);
+    void changeRequested(QVariant value, bool confirm);
 
 private:
     QString m_name;

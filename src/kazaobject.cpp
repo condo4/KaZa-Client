@@ -1,9 +1,14 @@
 #include "kazaobject.h"
 
+
 KaZaObject::KaZaObject(QObject *parent)
     : QObject{parent}
 {}
 
+quint32 KaZaObject::refcount() const
+{
+    return m_refcount;
+}
 
 QString KaZaObject::name() const {
     return m_name;
@@ -39,12 +44,12 @@ void KaZaObject::setValue(QVariant newValue) {
     }
 }
 
-void KaZaObject::changeRequest(QVariant newValue) {
-    emit changeRequested(newValue);
+void KaZaObject::changeRequest(QVariant newValue, bool confirm) {
+    emit changeRequested(newValue, confirm);
 }
 
 void KaZaObject::refresh() {
-    emit changeRequested(QVariant());
+    emit changeRequested(QVariant(), false);
 }
 
 void KaZaObject::put()

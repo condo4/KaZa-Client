@@ -8,7 +8,6 @@ KzPort::KzPort(QObject *parent)
     : QObject{parent}
 {
     m_server.listen();
-    qDebug() << "Create KzPort " << m_server.serverPort();
     m_protocol = KazaApplicationManager::protocol();
     QObject::connect(&m_server, &QTcpServer::newConnection, this, &KzPort::_newConnection);
     QObject::connect(m_protocol, &KaZaProtocol::frameSocketState, this, &KzPort::_socketState);
@@ -50,7 +49,6 @@ uint16_t KzPort::localPort() const
 void KzPort::_newConnection()
 {
     uint16_t id = ++m_instance;
-    qDebug() <<  "Register New PORT" << id <<  m_hostname << m_port;
     m_connections[id] = m_server.nextPendingConnection();
     QObject::connect(m_connections[id], &QTcpSocket::readyRead, this, &KzPort::_socketDataWrite);
     QObject::connect(m_connections[id], &QTcpSocket::stateChanged, this, &KzPort::_socketNewState);
@@ -59,7 +57,7 @@ void KzPort::_newConnection()
 
 void KzPort::_socketState(uint16_t id, uint16_t state)
 {
-    qDebug() << "_socketState" << id << QAbstractSocket::SocketState(state);
+    //qDebug() << "_socketState" << id << QAbstractSocket::SocketState(state);
 }
 
 void KzPort::_socketData(uint16_t id, QByteArray data)

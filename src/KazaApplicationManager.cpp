@@ -253,13 +253,13 @@ void KazaApplicationManager::_disconnected() {
 
 }
 
-void KazaApplicationManager::_sendObject(QVariant value)
+void KazaApplicationManager::_sendObject(QVariant value, bool confirm)
 {
     KaZaObject *obj = qobject_cast<KaZaObject *>(QObject::sender());
     if(!obj) {
         qWarning() << "Error in sendObject";
     }
-    m_protocol.sendObject(m_kobjects.indexOf(obj), value);
+    m_protocol.sendObject(m_kobjects.indexOf(obj), value, confirm);
 }
 
 bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port)

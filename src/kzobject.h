@@ -24,14 +24,14 @@ public:
 
 public slots:
     void setObject(const QString &newObject);
-    void set(const QVariant &newValue);
+    void set(const QVariant &newValue, bool confirm=false);
     void refresh();
 
 signals:
     void objectChanged();
     void valueChanged();
     void unitChanged();
-    void changeRequested(QVariant newData);
+    void changeRequested(QVariant newData, bool confirm=false);
 
 private:
     QString m_object;

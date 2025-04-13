@@ -80,7 +80,7 @@ private slots:
     void _encrypted();
     void _startApplication();
     void _disconnected();
-    void _sendObject(QVariant value);
+    void _sendObject(QVariant value, bool confirm);
 
 signals:
     void configuredChanged();
