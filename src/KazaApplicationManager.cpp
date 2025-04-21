@@ -16,13 +16,27 @@
 #include <QApplication>
 #include <QDomDocument>
 #include <QBuffer>
+#include <QThread>
 
 #include "kazaobject.h"
+#include "kazanotificationchecker.h"
 
 
 #ifdef ANDROID
     #include <QtCore/private/qandroidextras_p.h>
     #include <jni.h>
+
+// Fonction C++ qui sera appelée par Java
+extern "C" {
+JNIEXPORT void JNICALL
+Java_org_kaza_LocalService_taskNative(JNIEnv *env, jobject obj)
+{
+    // Votre code à exécuter toutes les heures ici
+    // Par exemple, vous pourriez émettre un signal vers votre application Qt
+    // ou effectuer une tâche en arrière-plan
+    KazaApplicationManager::tick();
+}
+}
 #endif
 
 KazaApplicationManager *KazaApplicationManager::m_instance = nullptr;
@@ -100,6 +114,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
         data.append(socket.readAll());
     }
     socket.close();
+    qDebug() << "DATA:" << data;
     xml.setContent(data);
     QString sslhost = xml.elementsByTagName("sslhost").item(0).toElement().text().trimmed();
     QString sslport = xml.elementsByTagName("sslport").item(0).toElement().text().trimmed();
@@ -151,8 +166,12 @@ bool KazaApplicationManager::setConfiguration(QString host,
 
     qDebug() << "Configuration registered, try connection";
 
-    if(_tryConnectClient(output.path() + "/client.cert", output.path() + "/ca.cert.pem", output.path() + "/client.key", clientPassword, sslhost, sslport.toInt()) == false)
+
+    if(_configureSslSocket(m_ssl, output.path() + "/client.cert", output.path() + "/ca.cert.pem", output.path() + "/client.key", clientPassword, sslhost, sslport.toInt()) == false)
         return false;
+
+    qInfo().noquote() << "Kaza try connection to #" + host + "#:" + QString::number(port);
+    m_ssl.connectToHostEncrypted(host, port);
     qDebug() << "Try connection valid";
 
     if(m_ssl.waitForEncrypted())
@@ -171,7 +190,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
     }
     else
     {
-        qWarning() << "Connection SSL Failed" << m_ssl.errorString();
+        qWarning() << "Connection SSL Failed" << m_ssl.errorString() << sslhost;
         return false;
     }
 
@@ -212,6 +231,7 @@ void KazaApplicationManager::applicationReday()
         "startService",
         "(Landroid/content/Intent;)Landroid/content/ComponentName;",
         serviceIntent.handle().object());
+    qDebug() << "START SERVICE RESULT: " << result.toString();
 #endif
 }
 
@@ -253,7 +273,7 @@ void KazaApplicationManager::_sendObject(QVariant value, bool confirm)
     m_protocol.sendObject(m_kobjects.indexOf(obj), value, confirm);
 }
 
-bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port)
+bool KazaApplicationManager::_configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port)
 {
 
     QFile caCertFile(FILEPATH(caCert));
@@ -297,9 +317,8 @@ bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const 
     if(m_debug) sslConf.setPeerVerifyMode(QSslSocket::VerifyNone);
 
 
-    m_ssl.setSslConfiguration(sslConf);
-    qInfo().noquote() << "Kaza try connection to #" + host + "#:" + QString::number(port);
-    m_ssl.connectToHostEncrypted(host, port);
+    ssl.setSslConfiguration(sslConf);
+
     return true;
 }
 
@@ -340,7 +359,10 @@ void KazaApplicationManager::connectClient()
     m_host = m_settings.value("ssl/host").toString();
     m_port = m_settings.value("ssl/port").toUInt();
 
-    _tryConnectClient(clientCert, caCert, clientKey, clientPassword, m_host, m_port);
+    _configureSslSocket(m_ssl, clientCert, caCert, clientKey, clientPassword, m_host, m_port);
+
+    qInfo().noquote() << "Kaza try connection to #" + m_host + "#:" + QString::number(m_port);
+    m_ssl.connectToHostEncrypted(m_host, m_port);
 }
 
 bool KazaApplicationManager::connected() const
@@ -393,6 +415,26 @@ void KazaApplicationManager::putKaZaObject(KaZaObject *obj)
 
 KaZaProtocol *KazaApplicationManager::protocol() {
     return &m_instance->m_protocol;
+}
+
+void KazaApplicationManager::tick(){
+    QString clientCert = m_instance->m_settings.value("ssl/client_cert").toString();
+    QString caCert = m_instance->m_settings.value("ssl/cacert").toString();
+    QString clientKey = m_instance->m_settings.value("ssl/client_key").toString();
+    QString clientPassword = m_instance->m_settings.value("ssl/client_pass").toString();
+    QString host = m_instance->m_settings.value("ssl/host").toString();
+    QString user = m_instance->m_settings.value("username").toString();
+    uint16_t port = m_instance->m_settings.value("ssl/port").toUInt();
+
+    QThread* networkThread = new QThread();
+    KaZaNotificationChecker* task = new KaZaNotificationChecker(clientCert, caCert, clientKey, clientPassword, host, user, port);
+    task->moveToThread(networkThread);
+
+    QObject::connect(networkThread, &QThread::started, task, &KaZaNotificationChecker::executeTask);
+    QObject::connect(task, &QObject::destroyed, networkThread, &QThread::quit);
+    QObject::connect(networkThread, &QThread::finished, networkThread, &QThread::deleteLater);
+
+    networkThread->start();
 }
 
 bool KazaApplicationManager::debug() const

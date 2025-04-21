@@ -61,6 +61,7 @@ public:
     static KaZaObject *getKaZaObject(const QString &name);
     static void putKaZaObject(KaZaObject * obj);
     static KaZaProtocol *protocol();
+    static void tick();
     bool debug() const;
     bool secured() const;
     bool ready() const;
@@ -98,7 +99,7 @@ signals:
     void errorMsgChanged();
 
 private:
-    bool _tryConnectClient(const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
+    bool _configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
     void __appStateChange(Qt::ApplicationState state);
     void _calculateAppChecksum();
 
