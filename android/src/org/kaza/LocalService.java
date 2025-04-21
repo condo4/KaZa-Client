@@ -15,7 +15,6 @@ public class LocalService extends QtService
 {
     private static final String TAG = "LocalService";
 
-
     public void notify(String title, String message) {
         try {
             NotificationManager m_notificationManager = (NotificationManager)
@@ -65,8 +64,8 @@ public class LocalService extends QtService
         int ret = super.onStartCommand(intent, flags, startId);
 
         // Do some work
-        Log.i(TAG, "onStartCommand");
-        this.notify("Service", "Notification from service");
+        //Log.i(TAG, "onStartCommand");
+        //this.notify("Service", "Notification from service");
 
         return ret;
     }

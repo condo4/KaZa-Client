@@ -205,7 +205,7 @@ void KazaApplicationManager::resume()
 void KazaApplicationManager::applicationReday()
 {
     qDebug() << "Application ready";
-#ifdef ANDROID
+#ifdef ANDROID_DISABLED
     auto activity = QJniObject(QNativeInterface::QAndroidApplication::context());
     QAndroidIntent serviceIntent(activity.object(), "org/kaza/LocalService");
     QJniObject result = activity.callObjectMethod(
