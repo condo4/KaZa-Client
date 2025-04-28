@@ -17,6 +17,7 @@
 #include <QDomDocument>
 #include <QBuffer>
 #include <QThread>
+#include "kazabackend.h"
 
 #include "kazaobject.h"
 #include "kazanotificationchecker.h"
@@ -28,14 +29,12 @@
 
 // Fonction C++ qui sera appelée par Java
 extern "C" {
-JNIEXPORT void JNICALL
-Java_org_kaza_LocalService_taskNative(JNIEnv *env, jobject obj)
+
+JNIEXPORT void JNICALL Java_org_kaza_LocalService_taskNative(JNIEnv *env, jobject obj)
 {
-    // Votre code à exécuter toutes les heures ici
-    // Par exemple, vous pourriez émettre un signal vers votre application Qt
-    // ou effectuer une tâche en arrière-plan
     KazaApplicationManager::tick();
 }
+
 }
 #endif
 
@@ -224,15 +223,6 @@ void KazaApplicationManager::resume()
 void KazaApplicationManager::applicationReday()
 {
     qDebug() << "Application ready";
-#ifdef ANDROID
-    auto activity = QJniObject(QNativeInterface::QAndroidApplication::context());
-    QAndroidIntent serviceIntent(activity.object(), "org/kaza/LocalService");
-    QJniObject result = activity.callObjectMethod(
-        "startService",
-        "(Landroid/content/Intent;)Landroid/content/ComponentName;",
-        serviceIntent.handle().object());
-    qDebug() << "START SERVICE RESULT: " << result.toString();
-#endif
 }
 
 void KazaApplicationManager::_encrypted()
@@ -256,6 +246,7 @@ void KazaApplicationManager::_startApplication()
     }
     QResource::registerResource(m_appFile, "/application");
     m_homepage = "qrc:/application/main.qml";
+    m_started = true;
     emit homepageChanged();
 }
 
@@ -358,6 +349,9 @@ void KazaApplicationManager::connectClient()
     QString clientPassword = m_settings.value("ssl/client_pass").toString();
     m_host = m_settings.value("ssl/host").toString();
     m_port = m_settings.value("ssl/port").toUInt();
+    QString user = m_instance->m_settings.value("username").toString();
+
+    KaZaBackend::configure(clientCert, caCert, clientKey, clientPassword, m_host, user, m_port);
 
     _configureSslSocket(m_ssl, clientCert, caCert, clientKey, clientPassword, m_host, m_port);
 
@@ -500,24 +494,27 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
 {
     if(command.startsWith("APP:"))
     {
-        if(m_settings.contains("Client/debug"))
+        if(!m_started)
         {
-            m_homepage = "file://" + m_settings.value("Client/debug").toString() + "/main.qml";
-            qDebug() << "USE DEBUG APPLICATION " << m_homepage;
-            emit homepageChanged();
-            return;
-        }
+            if(m_settings.contains("Client/debug"))
+            {
+                m_homepage = "file://" + m_settings.value("Client/debug").toString() + "/main.qml";
+                qDebug() << "USE DEBUG APPLICATION " << m_homepage;
+                emit homepageChanged();
+                return;
+            }
 
-        QStringList c = command.split(":");
-        m_appWanted = c[1];
-        if(c[1] != m_appChecksum)
-        {
-            qDebug() << "Need to download new version of application";
-            m_protocol.sendCommand("APP?");
-        }
-        else
-        {
-            _startApplication();
+            QStringList c = command.split(":");
+            m_appWanted = c[1];
+            if(c[1] != m_appChecksum)
+            {
+                qDebug() << "Need to download new version of application";
+                m_protocol.sendCommand("APP?");
+            }
+            else
+            {
+                _startApplication();
+            }
         }
     }
     else if(command.startsWith("OBJDESC"))

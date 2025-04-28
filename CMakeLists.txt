@@ -32,6 +32,7 @@ qt_add_executable(KaZa
     protocol/kazaprotocol.h         protocol/kazaprotocol.cpp
     ${PLATFORM_FILES}
     src/kazanotificationchecker.h src/kazanotificationchecker.cpp
+    src/kazabackend.h src/kazabackend.cpp
 )
 
 qt_add_resources(KaZa "KaZa"

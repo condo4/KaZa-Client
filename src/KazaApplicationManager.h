@@ -46,6 +46,7 @@ class KazaApplicationManager : public QObject
     QString m_host;
     uint16_t m_port;
     bool m_appStarted {false};
+    bool m_started {false};
 
     static KazaApplicationManager *m_instance;
 

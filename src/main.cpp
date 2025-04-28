@@ -14,6 +14,10 @@
 #define str(s) #s
 #define VERSION xstr(VERSION_NAME)
 
+#ifdef ANDROID
+#include <QtCore/private/qandroidextras_p.h>
+#endif
+
 int main(int argc, char *argv[])
 {
     QtWebView::initialize();
@@ -23,6 +27,16 @@ int main(int argc, char *argv[])
     app.setDesktopFileName("org.kazoe.kaza");
     app.setApplicationDisplayName("KaZa");
     app.setOrganizationName("KaZoe");
+
+#ifdef ANDROID
+    auto activity = QJniObject(QNativeInterface::QAndroidApplication::context());
+    QAndroidIntent serviceIntent(activity.object(), "org/kaza/LocalService");
+    QJniObject result = activity.callObjectMethod(
+        "startService",
+        "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+        serviceIntent.handle().object());
+    qDebug() << "START SERVICE RESULT: " << result.toString();
+#endif
 
     QQmlApplicationEngine engine;
     KazaApplicationManager manager;

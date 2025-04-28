@@ -67,6 +67,7 @@ public class LocalService extends QtService
 
         //startForeground(NOTIFICATION_ID, createForegroundNotification());
 
+        nativeOnCreate();
     }
 
     @Override
@@ -77,6 +78,8 @@ public class LocalService extends QtService
         instance = null;
 
         scheduleTask();
+
+        nativeOnDestroy();
     }
 
     @Override
@@ -156,4 +159,6 @@ public class LocalService extends QtService
 
     // Qt native method implemented in C++
     private native void taskNative();
+    private native void nativeOnCreate();
+    private native void nativeOnDestroy();
 }
