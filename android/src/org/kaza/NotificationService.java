@@ -13,8 +13,6 @@ import android.graphics.Color;
 import android.graphics.BitmapFactory;
 import android.content.Context;
 import android.content.Intent;
-import android.location.Location;
-import android.location.LocationManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -121,25 +119,9 @@ public class NotificationService extends Service
     private static final long BURST_MODE_IDLE_TIMEOUT_MS = 30000; // Exit if no request for 30s
     private long burstModeEndTime = 0; // Timestamp when burst mode ends (0 = disabled)
     private long burstModeStartTime = 0; // Timestamp when burst mode started
-    private long lastPositionRequestTime = 0; // Timestamp of last position request
 
-    // Active location request settings for burst mode
-    private static final int LOCATION_REQUEST_TIMEOUT_MS = 30000; // 30s max wait for GPS fix
-    private android.location.LocationListener activeLocationListener = null;
-    private final Object locationLock = new Object();
-    private Location pendingLocation = null;
-
-    // Smart location caching - Proactive location updates when screen ON
-    private static final long LOCATION_CACHE_INTERVAL_MS = 5 * 60 * 1000; // Update cache every 5 min
-    private static final long LOCATION_CACHE_MAX_AGE_MS = 10 * 60 * 1000; // Cache valid for 10 min
-    private android.location.LocationListener cacheLocationListener = null;
-    private Location cachedLocation = null;
-    private long cachedLocationTime = 0;
-
-    // Automatic position tracking - Send position to server when location changes significantly
-    private static final long AUTO_POSITION_MIN_TIME_MS = 5 * 60 * 1000; // 5 minutes minimum interval
-    private static final float AUTO_POSITION_MIN_DISTANCE_M = 30.0f; // 30 meters minimum distance
-    private android.location.LocationListener autoPositionListener = null;
+    // GPS/Location tracker
+    private KaZaTracker tracker = null;
 
     private int currentKeepAliveInterval = KEEPALIVE_SCREEN_ON_MS; // Current active interval
     private Runnable keepAliveRunnable = null;
@@ -149,27 +131,8 @@ public class NotificationService extends Service
     private long lastMessageReceivedTime = System.currentTimeMillis();
     private static final int MAX_NO_RESPONSE_CYCLES = 5; // Reconnect if no response for 5 cycles
 
-    // Network connectivity monitoring
-    private ConnectivityManager.NetworkCallback networkCallback = null;
-
-    // Screen state monitoring
-    private BroadcastReceiver screenStateReceiver = null;
-    private boolean isScreenOn = true;
-
-    // Idle detection
-    private boolean isDeviceIdle = false;
-    private long lastActivityTime = System.currentTimeMillis();
-
-    // Doze mode detection (API 23+)
-    private boolean isInDozeMode = false;
-    private BroadcastReceiver dozeReceiver = null;
-    private PowerManager powerManager = null;
-
-    // Battery level awareness
-    private int batteryLevel = 100;
-    private boolean isCharging = false;
-    private boolean isLowBattery = false;
-    private BroadcastReceiver batteryReceiver = null;
+    // Device state monitoring (battery, network, screen, doze)
+    private KaZaDeviceStateMonitor deviceMonitor = null;
 
     // App Standby Bucket monitoring (API 28+)
     private int currentStandbyBucket = -1;
@@ -445,17 +408,94 @@ public class NotificationService extends Service
         connectionThread.start();
         connectionHandler = new Handler(connectionThread.getLooper());
 
-        // Register network connectivity monitor
-        registerNetworkReceiver();
+        // Initialize GPS tracker
+        tracker = new KaZaTracker(this, connectionThread.getLooper());
+        tracker.setProtocolCallback(new KaZaTracker.ProtocolCallback() {
+            @Override
+            public void sendCommand(String command) throws Exception {
+                if (protocol != null) {
+                    protocol.sendCommand(command);
+                }
+            }
 
-        // Register screen state monitor for adaptive keep-alive
-        registerScreenStateReceiver();
+            @Override
+            public boolean isConnected() {
+                return NotificationService.this.isConnected;
+            }
+        });
 
-        // Register battery level monitor for battery-aware intervals
-        registerBatteryReceiver();
+        // Initialize device state monitor
+        deviceMonitor = new KaZaDeviceStateMonitor(this);
+        deviceMonitor.setCallback(new KaZaDeviceStateMonitor.StateChangeCallback() {
+            @Override
+            public void onScreenStateChanged(boolean isScreenOn) {
+                deviceMonitor.resetIdleTimer();
+                updateKeepAliveInterval();
 
-        // Register Doze mode monitor for deep sleep optimization (API 23+)
-        registerDozeReceiver();
+                // Start/stop location caching based on screen state
+                if (tracker != null) {
+                    if (isScreenOn) {
+                        tracker.startLocationCaching();
+                    } else {
+                        tracker.stopLocationCaching();
+                    }
+                }
+            }
+
+            @Override
+            public void onBatteryStateChanged(int level, boolean isCharging, boolean isLowBattery) {
+                updateKeepAliveInterval();
+            }
+
+            @Override
+            public void onNetworkAvailable() {
+                // Network is back, attempt to reconnect if disconnected
+                if (!isConnected && configured) {
+                    Log.i(TAG, "KaZaService: Network restored, attempting reconnection");
+                    // Reset reconnection attempts to allow immediate reconnection
+                    reconnectAttempts = 0;
+                    cancelScheduledReconnect();
+                    connectToServer();
+                }
+            }
+
+            @Override
+            public void onNetworkLost() {
+                // Network lost, disconnect if connected
+                if (isConnected) {
+                    Log.w(TAG, "KaZaService: Disconnecting due to network loss");
+                    disconnectFromServer();
+                }
+            }
+
+            @Override
+            public void onDozeStateChanged(boolean isInDozeMode) {
+                if (isInDozeMode) {
+                    // Unregister network callback during Doze to reduce wake-ups
+                    // Socket timeout will handle connection loss detection
+                    deviceMonitor.unregisterNetworkReceiver();
+                    Log.i(TAG, "KaZaService: Network monitoring suspended during Doze (socket timeout will handle disconnects)");
+                } else {
+                    // Re-register network callback when exiting Doze
+                    deviceMonitor.registerNetworkReceiver();
+                    Log.i(TAG, "KaZaService: Network monitoring resumed");
+                }
+                updateKeepAliveInterval();
+            }
+
+            @Override
+            public Context getContext() {
+                return NotificationService.this;
+            }
+        });
+
+        // Start monitoring device state
+        deviceMonitor.startMonitoring();
+
+        // Start location caching if screen is currently ON
+        if (deviceMonitor.deviceMonitor.isScreenOn()() && tracker != null) {
+            tracker.startLocationCaching();
+        }
 
         // Check app standby bucket and log initial state (API 28+)
         checkAppStandbyBucket();
@@ -483,18 +523,19 @@ public class NotificationService extends Service
         // Cancel any scheduled reconnections
         cancelScheduledReconnect();
 
-        // Unregister receivers
-        unregisterNetworkReceiver();
-        unregisterScreenStateReceiver();
-        unregisterBatteryReceiver();
-        unregisterDozeReceiver();
+        // Stop device state monitoring
+        if (deviceMonitor != null) {
+            deviceMonitor.stopMonitoring();
+        }
 
         // Stop periodic network monitoring
         stopNetworkTypeMonitoring();
 
         // Stop location tracking
-        stopLocationCaching();
-        stopAutomaticPositionTracking();
+        if (tracker != null) {
+            tracker.stopLocationCaching();
+            tracker.stopAutomaticPositionTracking();
+        }
 
         // Close SSL connection
         disconnectFromServer();
@@ -1308,7 +1349,9 @@ public class NotificationService extends Service
             if (!command.equals("PING") && !command.equals("PONG")) {
                 Log.i(TAG, "KaZaService: Received command: \"" + command + "\"");
                 // Update activity time for meaningful commands (not keep-alive)
-                lastActivityTime = System.currentTimeMillis();
+                if (deviceMonitor != null) {
+                    deviceMonitor.resetIdleTimer();
+                }
             }
 
             // Check for NOTIFY: command
@@ -1343,7 +1386,7 @@ public class NotificationService extends Service
                     // Protocol is now ready - connection fully established
 
                     // Send initial position
-                    position = getGPSPosition();
+                    position = tracker.getGPSPosition(burstModeEndTime, isScreenOn);
                     try {
                         protocol.sendCommand("POSITION:" + position);
                         Log.i(TAG, "KaZaService: Sent initial position: " + position);
@@ -1352,7 +1395,7 @@ public class NotificationService extends Service
                     }
 
                     // Start automatic position tracking (battery-efficient)
-                    startAutomaticPositionTracking();
+                    tracker.startAutomaticPositionTracking();
                     break;
 
                 case "DISCONNECT":
@@ -1366,7 +1409,7 @@ public class NotificationService extends Service
                     // Adaptive burst mode logic
                     long now = System.currentTimeMillis();
                     boolean wasInBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
-                    lastPositionRequestTime = now;
+                    tracker.updateLastPositionRequestTime();
 
                     if (!wasInBurstMode) {
                         // Starting new burst mode
@@ -1393,7 +1436,7 @@ public class NotificationService extends Service
                         }
                     }
 
-                    position = getGPSPosition();
+                    position = tracker.getGPSPosition(burstModeEndTime, isScreenOn);
                     try {
                         protocol.sendCommand("POSITION:" + position);
                         Log.i(TAG, "KaZaService: Sent position: " + position);
@@ -1415,250 +1458,7 @@ public class NotificationService extends Service
         }
     }
 
-    /**
-     * Get current GPS position
-     * Strategy: Use active GPS fix during burst mode + screen off for accuracy,
-     *           otherwise use cached location for battery efficiency
-     * @return Position string in format "lat,lon,accuracy,provider" or error message
-     */
-    private String getGPSPosition() {
-        try {
-            long now = System.currentTimeMillis();
 
-            // Check if we have a fresh cached location (screen ON case)
-            // Only use cache if NOT in burst mode with screen OFF (which needs active GPS)
-            boolean inBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
-            boolean needActiveFix = inBurstMode && !isScreenOn;
-
-            if (!needActiveFix && cachedLocation != null && cachedLocationTime > 0) {
-                long cacheAge = now - cachedLocationTime;
-                if (cacheAge < LOCATION_CACHE_MAX_AGE_MS) {
-                    String positionString = String.format("%.6f:%.6f:%.2f:%.1f:%s",
-                        cachedLocation.getLatitude(),
-                        cachedLocation.getLongitude(),
-                        cachedLocation.getAltitude(),
-                        cachedLocation.getAccuracy(),
-                        cachedLocation.getProvider());
-                    Log.i(TAG, "KaZaService: Position from cache (age: " + (cacheAge / 1000) + "s): " + positionString);
-                    return positionString;
-                } else {
-                    Log.d(TAG, "KaZaService: Cached location too old (" + (cacheAge / 1000) + "s) - requesting fresh location");
-                }
-            }
-
-            // Check permissions first
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ requires background location permission for background access
-                boolean hasBackgroundLocation = checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED;
-                boolean hasFineLocation = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED;
-
-                Log.i(TAG, "KaZaService: Fine location permission: " + hasFineLocation);
-                Log.i(TAG, "KaZaService: Background location permission: " + hasBackgroundLocation);
-
-                if (!hasFineLocation) {
-                    return "ERROR:No location permission";
-                }
-                if (!hasBackgroundLocation) {
-                    Log.w(TAG, "KaZaService: ⚠ No background location permission - location only available while app is open");
-                    Log.w(TAG, "KaZaService: User needs to grant 'Allow all the time' in app settings");
-                    // Try anyway - might work if app is in foreground
-                }
-            }
-
-            LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-
-            if (locationManager == null) {
-                Log.w(TAG, "KaZaService: LocationManager not available");
-                return "ERROR:LocationManager not available";
-            }
-
-            // Check if location services are enabled
-            boolean gpsEnabled = false;
-            boolean networkEnabled = false;
-
-            try {
-                gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
-            } catch (Exception e) {
-                Log.w(TAG, "KaZaService: GPS provider check failed: " + e.getMessage());
-            }
-
-            try {
-                networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
-            } catch (Exception e) {
-                Log.w(TAG, "KaZaService: Network provider check failed: " + e.getMessage());
-            }
-
-            if (!gpsEnabled && !networkEnabled) {
-                Log.w(TAG, "KaZaService: No location providers enabled");
-                return "ERROR:Location services disabled";
-            }
-
-            Log.i(TAG, "KaZaService: GPS enabled: " + gpsEnabled + ", Network enabled: " + networkEnabled);
-
-            // Determine if we should request active GPS fix (reuse variables from cache check above)
-            boolean shouldRequestActiveFix = needActiveFix && gpsEnabled;
-
-            // Request active GPS fix during burst mode when screen is off (accurate tracking needed)
-            if (shouldRequestActiveFix) {
-                Log.i(TAG, "KaZaService: Burst mode + screen off - requesting active GPS fix for accuracy");
-                Location freshLocation = requestSingleLocationUpdate(locationManager);
-                if (freshLocation != null) {
-                    String positionString = String.format("%.6f:%.6f:%.2f:%.1f:%s",
-                        freshLocation.getLatitude(),
-                        freshLocation.getLongitude(),
-                        cachedLocation.getAltitude(),
-                        freshLocation.getAccuracy(),
-                        freshLocation.getProvider());
-                    Log.i(TAG, "KaZaService: Fresh position (active GPS): " + positionString);
-                    return positionString;
-                }
-                Log.w(TAG, "KaZaService: Active GPS fix timeout - falling back to cached location");
-            }
-
-            // Fallback: Use cached location (battery efficient for screen on or normal mode)
-            Location bestLocation = null;
-
-            // Try GPS provider first (most accurate)
-            if (gpsEnabled) {
-                try {
-                    Location gpsLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                    if (gpsLocation != null) {
-                        bestLocation = gpsLocation;
-                        Log.i(TAG, "KaZaService: Got GPS location (age: " +
-                            (System.currentTimeMillis() - gpsLocation.getTime()) / 1000 + "s)");
-                    }
-                } catch (SecurityException e) {
-                    Log.e(TAG, "KaZaService: No permission for GPS location: " + e.getMessage());
-                    return "ERROR:No location permission";
-                }
-            }
-
-            // Try network provider if GPS not available or as fallback
-            if (networkEnabled) {
-                try {
-                    Location networkLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-                    if (networkLocation != null) {
-                        // Use network location if no GPS location, or if network location is newer
-                        if (bestLocation == null || networkLocation.getTime() > bestLocation.getTime()) {
-                            bestLocation = networkLocation;
-                            Log.i(TAG, "KaZaService: Got Network location (age: " +
-                                (System.currentTimeMillis() - networkLocation.getTime()) / 1000 + "s)");
-                        }
-                    }
-                } catch (SecurityException e) {
-                    Log.e(TAG, "KaZaService: No permission for Network location: " + e.getMessage());
-                    if (bestLocation == null) {
-                        return "ERROR:No location permission";
-                    }
-                }
-            }
-
-            if (bestLocation == null) {
-                Log.w(TAG, "KaZaService: No last known location available");
-                return "ERROR:No location available";
-            }
-
-            // Format: "lat,lon,accuracy,provider"
-            String positionString = String.format("%.6f:%.6f:%.2f:%.1f:%s",
-                bestLocation.getLatitude(),
-                bestLocation.getLongitude(),
-                bestLocation.getAltitude(),
-                bestLocation.getAccuracy(),
-                bestLocation.getProvider());
-
-            Log.i(TAG, "KaZaService: Position (cached): " + positionString);
-            return positionString;
-
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Error getting GPS position: " + e.getMessage(), e);
-            return "ERROR:" + e.getMessage();
-        }
-    }
-
-    /**
-     * Request a single fresh GPS location update with timeout
-     * Used during burst mode for accurate position tracking
-     * @param locationManager LocationManager instance
-     * @return Fresh Location or null if timeout/error
-     */
-    private Location requestSingleLocationUpdate(LocationManager locationManager) {
-        synchronized (locationLock) {
-            pendingLocation = null;
-
-            try {
-                // Create one-time location listener
-                activeLocationListener = new android.location.LocationListener() {
-                    @Override
-                    public void onLocationChanged(Location location) {
-                        synchronized (locationLock) {
-                            if (pendingLocation == null || location.getAccuracy() < pendingLocation.getAccuracy()) {
-                                pendingLocation = location;
-                                Log.i(TAG, "KaZaService: Received fresh GPS fix (accuracy: " +
-                                      location.getAccuracy() + "m)");
-                            }
-                            locationLock.notifyAll();
-                        }
-                    }
-
-                    @Override
-                    public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
-
-                    @Override
-                    public void onProviderEnabled(String provider) {}
-
-                    @Override
-                    public void onProviderDisabled(String provider) {}
-                };
-
-                // Request single update from GPS provider
-                locationManager.requestSingleUpdate(
-                    LocationManager.GPS_PROVIDER,
-                    activeLocationListener,
-                    connectionThread.getLooper()
-                );
-
-                Log.i(TAG, "KaZaService: Waiting for GPS fix (max " +
-                      (LOCATION_REQUEST_TIMEOUT_MS / 1000) + "s)...");
-
-                // Wait for location update with timeout
-                locationLock.wait(LOCATION_REQUEST_TIMEOUT_MS);
-
-                // Clean up listener
-                locationManager.removeUpdates(activeLocationListener);
-                activeLocationListener = null;
-
-                return pendingLocation;
-
-            } catch (SecurityException e) {
-                Log.e(TAG, "KaZaService: No permission for active location request: " + e.getMessage());
-                return null;
-            } catch (InterruptedException e) {
-                Log.w(TAG, "KaZaService: Location request interrupted: " + e.getMessage());
-                if (activeLocationListener != null) {
-                    try {
-                        locationManager.removeUpdates(activeLocationListener);
-                    } catch (Exception ex) {
-                        // Ignore cleanup errors
-                    }
-                    activeLocationListener = null;
-                }
-                return null;
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Error requesting location update: " + e.getMessage());
-                if (activeLocationListener != null) {
-                    try {
-                        locationManager.removeUpdates(activeLocationListener);
-                    } catch (Exception ex) {
-                        // Ignore cleanup errors
-                    }
-                    activeLocationListener = null;
-                }
-                return null;
-            }
-        }
-    }
 
     /**
      * Disconnect from SSL server
@@ -1667,7 +1467,9 @@ public class NotificationService extends Service
         Log.i(TAG, "KaZaService: Disconnecting from server");
 
         // Stop automatic position tracking
-        stopAutomaticPositionTracking();
+        if (tracker != null) {
+            tracker.stopAutomaticPositionTracking();
+        }
 
         // Stop keep-alive
         stopKeepAlive();
@@ -1852,88 +1654,6 @@ public class NotificationService extends Service
     }
 
     /**
-     * Register network connectivity callback to detect network changes
-     */
-    private void registerNetworkReceiver() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                ConnectivityManager connectivityManager =
-                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-
-                if (connectivityManager == null) {
-                    Log.w(TAG, "KaZaService: ConnectivityManager not available");
-                    return;
-                }
-
-                networkCallback = new ConnectivityManager.NetworkCallback() {
-                    @Override
-                    public void onAvailable(Network network) {
-                        Log.i(TAG, "KaZaService: Network available - " + network);
-                        // Network is back, attempt to reconnect if disconnected
-                        if (!isConnected && configured) {
-                            Log.i(TAG, "KaZaService: Network restored, attempting reconnection");
-                            // Reset reconnection attempts to allow immediate reconnection
-                            reconnectAttempts = 0;
-                            cancelScheduledReconnect();
-                            connectToServer();
-                        }
-                    }
-
-                    @Override
-                    public void onLost(Network network) {
-                        Log.w(TAG, "KaZaService: Network lost - " + network);
-                        // Network lost, disconnect if connected
-                        if (isConnected) {
-                            Log.w(TAG, "KaZaService: Disconnecting due to network loss");
-                            disconnectFromServer();
-                        }
-                    }
-
-                    @Override
-                    public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
-                        boolean hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
-                        boolean validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
-                        Log.d(TAG, "KaZaService: Network capabilities changed - Internet: " + hasInternet + ", Validated: " + validated);
-                    }
-                };
-
-                // Register callback for any network
-                NetworkRequest request = new NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build();
-
-                connectivityManager.registerNetworkCallback(request, networkCallback);
-                Log.i(TAG, "KaZaService: Network connectivity monitoring registered");
-
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to register network callback: " + e.getMessage());
-            }
-        } else {
-            Log.i(TAG, "KaZaService: Network monitoring requires Android N+ (API 24+)");
-        }
-    }
-
-    /**
-     * Unregister network connectivity callback
-     */
-    private void unregisterNetworkReceiver() {
-        if (networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                ConnectivityManager connectivityManager =
-                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-
-                if (connectivityManager != null) {
-                    connectivityManager.unregisterNetworkCallback(networkCallback);
-                    Log.i(TAG, "KaZaService: Network connectivity monitoring unregistered");
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to unregister network callback: " + e.getMessage());
-            }
-            networkCallback = null;
-        }
-    }
-
-    /**
      * Update keep-alive interval based on current conditions (adaptive)
      * Priority: Doze mode > Burst mode > Screen state > Idle state > Battery level > Network type
      */
@@ -1941,7 +1661,7 @@ public class NotificationService extends Service
         int oldInterval = currentKeepAliveInterval;
 
         // Update idle detection
-        updateIdleState();
+        deviceMonitor.updateIdleState();
 
         // Check if burst mode is active
         long now = System.currentTimeMillis();
@@ -1968,15 +1688,15 @@ public class NotificationService extends Service
             currentKeepAliveInterval = KEEPALIVE_SCREEN_ON_MS;
         }
         // Priority 3: Low battery + screen off = ultra conservative
-        else if (isLowBattery && !isScreenOn) {
-            if (isDeviceIdle) {
+        else if (deviceMonitor.isLowBattery() && !isScreenOn) {
+            if (deviceMonitor.isDeviceIdle()) {
                 currentKeepAliveInterval = KEEPALIVE_LOW_BATTERY_IDLE_MS;
             } else {
                 currentKeepAliveInterval = KEEPALIVE_LOW_BATTERY_SCREEN_OFF_MS;
             }
         }
         // Priority 4: Device idle (no activity for 5+ minutes)
-        else if (isDeviceIdle) {
+        else if (deviceMonitor.isDeviceIdle()) {
             currentKeepAliveInterval = KEEPALIVE_IDLE_MS;
         }
         // Priority 5: Screen off but not idle
@@ -1984,9 +1704,9 @@ public class NotificationService extends Service
             currentKeepAliveInterval = KEEPALIVE_SCREEN_OFF_MS;
         }
         // Priority 6: Network type (WiFi vs Mobile)
-        else if (isOnWifi()) {
+        else if (deviceMonitor.isOnWifi()) {
             currentKeepAliveInterval = KEEPALIVE_WIFI_MS;
-        } else if (isOnMobileData()) {
+        } else if (deviceMonitor.isOnMobileData()) {
             currentKeepAliveInterval = KEEPALIVE_MOBILE_MS;
         } else {
             // Unknown network type, use conservative interval
@@ -2001,8 +1721,8 @@ public class NotificationService extends Service
         }
 
         // Early exit from burst mode if idle (no position requests for 30s)
-        if (inBurstMode && lastPositionRequestTime > 0) {
-            long timeSinceLastRequest = now - lastPositionRequestTime;
+        if (inBurstMode && tracker != null && tracker.getLastPositionRequestTime() > 0) {
+            long timeSinceLastRequest = now - tracker.getLastPositionRequestTime();
             if (timeSinceLastRequest > BURST_MODE_IDLE_TIMEOUT_MS) {
                 Log.i(TAG, "KaZaService: Burst mode early exit - no position requests for " +
                       (timeSinceLastRequest / 1000) + "s");
@@ -2034,19 +1754,19 @@ public class NotificationService extends Service
             return "BURST MODE (tracking active, " + remainingSec + "s remaining)";
         } else if (isScreenOn) {
             return "Screen ON (fast response)";
-        } else if (isLowBattery && !isScreenOn) {
-            if (isDeviceIdle) {
+        } else if (deviceMonitor.isLowBattery() && !isScreenOn) {
+            if (deviceMonitor.isDeviceIdle()) {
                 return "LOW BATTERY + IDLE (4min ultra-save)";
             } else {
                 return "LOW BATTERY + Screen OFF (3min save)";
             }
-        } else if (isDeviceIdle) {
+        } else if (deviceMonitor.isDeviceIdle()) {
             return "Device IDLE (2min battery save)";
         } else if (!isScreenOn) {
             return "Screen OFF (90s battery save)";
-        } else if (isOnWifi()) {
+        } else if (deviceMonitor.isOnWifi()) {
             return "WiFi (60s moderate)";
-        } else if (isOnMobileData()) {
+        } else if (deviceMonitor.isOnMobileData()) {
             return "Mobile Data (90s conservative)";
         } else {
             return "Unknown network";
@@ -2066,7 +1786,7 @@ public class NotificationService extends Service
         // Active states (screen on or burst mode): short timeout for responsiveness
         long now = System.currentTimeMillis();
         boolean inBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
-        if (isScreenOn || inBurstMode) {
+        if (deviceMonitor.isScreenOn() || inBurstMode) {
             return SOCKET_TIMEOUT_ACTIVE_MS;
         }
 
@@ -2077,7 +1797,7 @@ public class NotificationService extends Service
     /**
      * Check if device is currently on WiFi
      */
-    private boolean isOnWifi() {
+    private boolean deviceMonitor.isOnWifi() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             if (cm == null) return false;
@@ -2104,7 +1824,7 @@ public class NotificationService extends Service
     /**
      * Check if device is currently on mobile data
      */
-    private boolean isOnMobileData() {
+    private boolean deviceMonitor.isOnMobileData() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             if (cm == null) return false;
@@ -2131,241 +1851,15 @@ public class NotificationService extends Service
     /**
      * Update idle detection based on time since last activity
      */
-    private void updateIdleState() {
+    private void deviceMonitor.updateIdleState() {
         long idleTime = System.currentTimeMillis() - lastActivityTime;
         long IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
-        boolean wasIdle = isDeviceIdle;
-        isDeviceIdle = (idleTime > IDLE_THRESHOLD_MS) && !isScreenOn;
+        boolean wasIdle = deviceMonitor.isDeviceIdle();
+        deviceMonitor.isDeviceIdle() = (idleTime > IDLE_THRESHOLD_MS) && !deviceMonitor.isScreenOn();
 
-        if (wasIdle != isDeviceIdle) {
-            Log.d(TAG, "KaZaService: Idle state changed: " + wasIdle + " → " + isDeviceIdle);
-        }
-    }
-
-    /**
-     * Register screen state receiver to detect screen on/off
-     */
-    private void registerScreenStateReceiver() {
-        try {
-            screenStateReceiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    if (intent.getAction() == null) return;
-
-                    if (intent.getAction().equals(Intent.ACTION_SCREEN_ON)) {
-                        Log.i(TAG, "KaZaService: Screen turned ON - switching to real-time mode");
-                        isScreenOn = true;
-                        lastActivityTime = System.currentTimeMillis(); // Reset idle timer
-                        updateKeepAliveInterval();
-                        // Start proactive location caching when screen is ON
-                        startLocationCaching();
-                    } else if (intent.getAction().equals(Intent.ACTION_SCREEN_OFF)) {
-                        Log.i(TAG, "KaZaService: Screen turned OFF - switching to battery save mode");
-                        isScreenOn = false;
-                        updateKeepAliveInterval();
-                        // Stop location caching to save battery when screen is OFF
-                        stopLocationCaching();
-                    }
-                }
-            };
-
-            IntentFilter filter = new IntentFilter();
-            filter.addAction(Intent.ACTION_SCREEN_ON);
-            filter.addAction(Intent.ACTION_SCREEN_OFF);
-            registerReceiver(screenStateReceiver, filter);
-
-            // Initialize current screen state
-            PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (powerManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
-                isScreenOn = powerManager.isInteractive();
-            } else if (powerManager != null) {
-                isScreenOn = powerManager.isScreenOn();
-            }
-
-            Log.i(TAG, "KaZaService: Screen state monitoring registered (current: " +
-                  (isScreenOn ? "ON" : "OFF") + ")");
-
-            // Start location caching if screen is currently ON
-            if (isScreenOn) {
-                startLocationCaching();
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Failed to register screen state receiver: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Unregister screen state receiver
-     */
-    private void unregisterScreenStateReceiver() {
-        if (screenStateReceiver != null) {
-            try {
-                unregisterReceiver(screenStateReceiver);
-                Log.i(TAG, "KaZaService: Screen state monitoring unregistered");
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to unregister screen state receiver: " + e.getMessage());
-            }
-            screenStateReceiver = null;
-        }
-    }
-
-    /**
-     * Register battery state receiver to detect battery level and charging status
-     */
-    private void registerBatteryReceiver() {
-        try {
-            batteryReceiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    if (intent == null) return;
-
-                    int level = intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
-                    int scale = intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1);
-                    int status = intent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
-
-                    if (level >= 0 && scale > 0) {
-                        int oldBatteryLevel = batteryLevel;
-                        batteryLevel = (level * 100) / scale;
-
-                        boolean wasCharging = isCharging;
-                        isCharging = (status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
-                                      status == android.os.BatteryManager.BATTERY_STATUS_FULL);
-
-                        boolean wasLowBattery = isLowBattery;
-
-                        // Update low battery status based on thresholds
-                        if (!isCharging) {
-                            if (batteryLevel < LOW_BATTERY_THRESHOLD) {
-                                isLowBattery = true;
-                            } else if (batteryLevel > BATTERY_RESTORE_THRESHOLD) {
-                                isLowBattery = false;
-                            }
-                            // Hysteresis: if between 15-20%, keep previous state
-                        } else {
-                            // When charging, clear low battery flag
-                            isLowBattery = false;
-                        }
-
-                        // Log significant changes
-                        if (wasCharging != isCharging) {
-                            Log.i(TAG, "KaZaService: Charging state changed: " + (isCharging ? "CHARGING" : "NOT CHARGING"));
-                        }
-
-                        if (wasLowBattery != isLowBattery) {
-                            if (isLowBattery) {
-                                Log.w(TAG, "KaZaService: ⚠ Low battery mode activated (" + batteryLevel + "%) - reducing network activity");
-                            } else {
-                                Log.i(TAG, "KaZaService: Low battery mode deactivated (" + batteryLevel + "%) - restoring normal intervals");
-                            }
-                            updateKeepAliveInterval();
-                        }
-
-                        // Log battery level changes every 10%
-                        if (Math.abs(oldBatteryLevel - batteryLevel) >= 10) {
-                            Log.i(TAG, "KaZaService: Battery level: " + batteryLevel + "%" +
-                                  (isCharging ? " (charging)" : "") +
-                                  (isLowBattery ? " [LOW BATTERY MODE]" : ""));
-                        }
-                    }
-                }
-            };
-
-            IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-            registerReceiver(batteryReceiver, filter);
-
-            Log.i(TAG, "KaZaService: Battery monitoring registered");
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Failed to register battery receiver: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Unregister battery state receiver
-     */
-    private void unregisterBatteryReceiver() {
-        if (batteryReceiver != null) {
-            try {
-                unregisterReceiver(batteryReceiver);
-                Log.i(TAG, "KaZaService: Battery monitoring unregistered");
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to unregister battery receiver: " + e.getMessage());
-            }
-            batteryReceiver = null;
-        }
-    }
-
-    /**
-     * Register Doze mode receiver to detect when device enters/exits Doze mode
-     * Doze mode is Android 6.0+ (API 23+) deep sleep optimization
-     */
-    private void registerDozeReceiver() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            Log.d(TAG, "KaZaService: Doze mode not available (API < 23)");
-            return;
-        }
-
-        try {
-            // Get PowerManager for Doze detection
-            powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
-
-            dozeReceiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    if (intent == null || intent.getAction() == null) return;
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && powerManager != null) {
-                        boolean wasInDozeMode = isInDozeMode;
-                        isInDozeMode = powerManager.isDeviceIdleMode();
-
-                        if (wasInDozeMode != isInDozeMode) {
-                            if (isInDozeMode) {
-                                Log.w(TAG, "KaZaService: ⏸ Entered Doze mode - switching to 15-minute intervals");
-                                // Unregister network callback during Doze to reduce wake-ups
-                                // Socket timeout will handle connection loss detection
-                                unregisterNetworkReceiver();
-                                Log.i(TAG, "KaZaService: Network monitoring suspended during Doze (socket timeout will handle disconnects)");
-                            } else {
-                                Log.i(TAG, "KaZaService: ▶ Exited Doze mode - restoring normal intervals");
-                                // Re-register network callback when exiting Doze
-                                registerNetworkReceiver();
-                                Log.i(TAG, "KaZaService: Network monitoring resumed");
-                            }
-                            updateKeepAliveInterval();
-                        }
-                    }
-                }
-            };
-
-            IntentFilter filter = new IntentFilter();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                filter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
-            }
-            registerReceiver(dozeReceiver, filter);
-
-            // Initialize current Doze state
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && powerManager != null) {
-                isInDozeMode = powerManager.isDeviceIdleMode();
-                Log.i(TAG, "KaZaService: Doze mode monitoring registered (current: " +
-                      (isInDozeMode ? "DOZE" : "ACTIVE") + ")");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Failed to register Doze receiver: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Unregister Doze mode receiver
-     */
-    private void unregisterDozeReceiver() {
-        if (dozeReceiver != null) {
-            try {
-                unregisterReceiver(dozeReceiver);
-                Log.i(TAG, "KaZaService: Doze mode monitoring unregistered");
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to unregister Doze receiver: " + e.getMessage());
-            }
-            dozeReceiver = null;
+        if (wasIdle != deviceMonitor.isDeviceIdle()) {
+            Log.d(TAG, "KaZaService: Idle state changed: " + wasIdle + " → " + deviceMonitor.isDeviceIdle());
         }
     }
 
@@ -2480,221 +1974,5 @@ public class NotificationService extends Service
         }
         networkCheckRunnable = null;
         networkCheckHandler = null;
-    }
-
-    /**
-     * Start smart location caching - Proactively requests location updates when screen is ON
-     * Caches fresh location every 5 minutes for battery-efficient position responses
-     */
-    private void startLocationCaching() {
-        try {
-            LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            if (locationManager == null) {
-                Log.w(TAG, "KaZaService: LocationManager not available for caching");
-                return;
-            }
-
-            // Check permissions
-            boolean hasLocationPermission = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
-
-            if (!hasLocationPermission) {
-                Log.w(TAG, "KaZaService: No location permission - cannot start location caching");
-                return;
-            }
-
-            // Check if GPS is enabled
-            boolean gpsEnabled = false;
-            try {
-                gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
-            } catch (Exception e) {
-                Log.w(TAG, "KaZaService: GPS provider check failed: " + e.getMessage());
-            }
-
-            if (!gpsEnabled) {
-                Log.d(TAG, "KaZaService: GPS disabled - location caching not started");
-                return;
-            }
-
-            // Stop existing caching if any
-            stopLocationCaching();
-
-            // Create location listener for caching
-            cacheLocationListener = new android.location.LocationListener() {
-                @Override
-                public void onLocationChanged(Location location) {
-                    cachedLocation = location;
-                    cachedLocationTime = System.currentTimeMillis();
-                    Log.i(TAG, "KaZaService: Location cache updated (accuracy: " +
-                          location.getAccuracy() + "m, age: 0s)");
-                }
-
-                @Override
-                public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
-
-                @Override
-                public void onProviderEnabled(String provider) {
-                    Log.i(TAG, "KaZaService: GPS enabled - location caching active");
-                }
-
-                @Override
-                public void onProviderDisabled(String provider) {
-                    Log.w(TAG, "KaZaService: GPS disabled - location cache may become stale");
-                }
-            };
-
-            // Request location updates every 5 minutes
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                LOCATION_CACHE_INTERVAL_MS,
-                0, // No distance filter - update based on time only
-                cacheLocationListener,
-                connectionThread.getLooper()
-            );
-
-            Log.i(TAG, "KaZaService: Smart location caching started (updates every " +
-                  (LOCATION_CACHE_INTERVAL_MS / 1000 / 60) + " minutes)");
-
-        } catch (SecurityException e) {
-            Log.e(TAG, "KaZaService: No permission for location caching: " + e.getMessage());
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Failed to start location caching: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Stop smart location caching when screen turns OFF
-     */
-    private void stopLocationCaching() {
-        if (cacheLocationListener != null) {
-            try {
-                LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-                if (locationManager != null) {
-                    locationManager.removeUpdates(cacheLocationListener);
-                    Log.i(TAG, "KaZaService: Smart location caching stopped");
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to stop location caching: " + e.getMessage());
-            }
-            cacheLocationListener = null;
-        }
-    }
-
-    /**
-     * Start automatic position tracking
-     * Sends position updates to server when location changes by ≥30m or ≥5 minutes elapsed
-     * Battery-efficient: only wakes service when criteria are met
-     */
-    private void startAutomaticPositionTracking() {
-        try {
-            LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            if (locationManager == null) {
-                Log.w(TAG, "KaZaService: LocationManager not available");
-                return;
-            }
-
-            // Check if GPS is enabled
-            boolean gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
-            if (!gpsEnabled) {
-                Log.w(TAG, "KaZaService: GPS disabled - automatic position tracking not started");
-                // Try to start with network provider as fallback
-                boolean networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
-                if (!networkEnabled) {
-                    Log.w(TAG, "KaZaService: No location providers available");
-                    return;
-                }
-            }
-
-            // Stop existing tracking if any
-            stopAutomaticPositionTracking();
-
-            // Create location listener that sends position updates to server
-            autoPositionListener = new android.location.LocationListener() {
-                @Override
-                public void onLocationChanged(Location location) {
-                    // Format position string
-                    String position = String.format("%.6f:%.6f:%.2f:%.1f:%s",
-                        location.getLatitude(),
-                        location.getLongitude(),
-                        location.getAltitude(),
-                        location.getAccuracy(),
-                        location.getProvider());
-
-                    Log.i(TAG, "KaZaService: Auto position update triggered (moved ≥" +
-                          AUTO_POSITION_MIN_DISTANCE_M + "m or ≥" +
-                          (AUTO_POSITION_MIN_TIME_MS / 1000 / 60) + "min)");
-                    Log.i(TAG, "KaZaService: Position: " + position);
-
-                    // Send position to server
-                    if (protocol != null && isConnected) {
-                        try {
-                            protocol.sendCommand("POSITION:" + position);
-                            Log.i(TAG, "KaZaService: Auto position sent to server");
-                        } catch (Exception e) {
-                            Log.e(TAG, "KaZaService: Failed to send auto position: " + e.getMessage());
-                        }
-                    } else {
-                        Log.w(TAG, "KaZaService: Not connected - cannot send position");
-                    }
-
-                    // Also update cache
-                    cachedLocation = location;
-                    cachedLocationTime = System.currentTimeMillis();
-                }
-
-                @Override
-                public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
-
-                @Override
-                public void onProviderEnabled(String provider) {
-                    Log.i(TAG, "KaZaService: Location provider enabled: " + provider);
-                }
-
-                @Override
-                public void onProviderDisabled(String provider) {
-                    Log.w(TAG, "KaZaService: Location provider disabled: " + provider);
-                }
-            };
-
-            // Request location updates with 30m distance and 5min time criteria
-            // System will only wake the service when EITHER criterion is met
-            String provider = gpsEnabled ? LocationManager.GPS_PROVIDER : LocationManager.NETWORK_PROVIDER;
-            locationManager.requestLocationUpdates(
-                provider,
-                AUTO_POSITION_MIN_TIME_MS,  // Min time: 5 minutes
-                AUTO_POSITION_MIN_DISTANCE_M, // Min distance: 30 meters
-                autoPositionListener,
-                connectionThread.getLooper()
-            );
-
-            Log.i(TAG, "KaZaService: Automatic position tracking started");
-            Log.i(TAG, "KaZaService: - Provider: " + provider);
-            Log.i(TAG, "KaZaService: - Min distance: " + AUTO_POSITION_MIN_DISTANCE_M + "m");
-            Log.i(TAG, "KaZaService: - Min time: " + (AUTO_POSITION_MIN_TIME_MS / 1000 / 60) + " minutes");
-            Log.i(TAG, "KaZaService: Position updates will be sent automatically when criteria are met");
-
-        } catch (SecurityException e) {
-            Log.e(TAG, "KaZaService: No permission for automatic position tracking: " + e.getMessage());
-        } catch (Exception e) {
-            Log.e(TAG, "KaZaService: Failed to start automatic position tracking: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Stop automatic position tracking
-     */
-    private void stopAutomaticPositionTracking() {
-        if (autoPositionListener != null) {
-            try {
-                LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-                if (locationManager != null) {
-                    locationManager.removeUpdates(autoPositionListener);
-                    Log.i(TAG, "KaZaService: Automatic position tracking stopped");
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Failed to stop automatic position tracking: " + e.getMessage());
-            }
-            autoPositionListener = null;
-        }
     }
 }

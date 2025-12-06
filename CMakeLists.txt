@@ -27,6 +27,8 @@ if(ANDROID)
         android/src/org/kaza/ServiceBridge.java
         android/src/org/kaza/BootReceiver.java
         android/src/org/kaza/KaZaProtocol.java
+        android/src/org/kaza/KaZaTracker.java
+        android/src/org/kaza/KaZaDeviceStateMonitor.java
     )
     include_directories("android")
 endif(ANDROID)
