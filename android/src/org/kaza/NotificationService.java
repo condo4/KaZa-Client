@@ -434,7 +434,7 @@ public class NotificationService extends Service
 
                 // Start/stop location caching based on screen state
                 if (tracker != null) {
-                    if (isScreenOn) {
+                    if (deviceMonitor.isScreenOn()) {
                         tracker.startLocationCaching();
                     } else {
                         tracker.stopLocationCaching();
@@ -493,7 +493,7 @@ public class NotificationService extends Service
         deviceMonitor.startMonitoring();
 
         // Start location caching if screen is currently ON
-        if (deviceMonitor.deviceMonitor.isScreenOn()() && tracker != null) {
+        if (deviceMonitor.isScreenOn() && tracker != null) {
             tracker.startLocationCaching();
         }
 
@@ -1386,7 +1386,7 @@ public class NotificationService extends Service
                     // Protocol is now ready - connection fully established
 
                     // Send initial position
-                    position = tracker.getGPSPosition(burstModeEndTime, isScreenOn);
+                    position = tracker.getGPSPosition(burstModeEndTime, deviceMonitor.isScreenOn());
                     try {
                         protocol.sendCommand("POSITION:" + position);
                         Log.i(TAG, "KaZaService: Sent initial position: " + position);
@@ -1436,7 +1436,7 @@ public class NotificationService extends Service
                         }
                     }
 
-                    position = tracker.getGPSPosition(burstModeEndTime, isScreenOn);
+                    position = tracker.getGPSPosition(burstModeEndTime, deviceMonitor.isScreenOn());
                     try {
                         protocol.sendCommand("POSITION:" + position);
                         Log.i(TAG, "KaZaService: Sent position: " + position);
@@ -1668,7 +1668,7 @@ public class NotificationService extends Service
         boolean inBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
 
         // Disable burst mode if low battery (position tracking requires more power)
-        if (inBurstMode && isLowBattery) {
+        if (inBurstMode && deviceMonitor.isLowBattery()) {
             Log.w(TAG, "KaZaService: Burst mode disabled due to low battery - using conservative intervals");
             burstModeEndTime = 0;
             inBurstMode = false;
@@ -1676,7 +1676,7 @@ public class NotificationService extends Service
 
         // Priority 0: Doze mode - HIGHEST PRIORITY (Android compliance)
         // When in Doze, device is in deep sleep, use 15-minute intervals
-        if (isInDozeMode) {
+        if (deviceMonitor.isInDozeMode()) {
             currentKeepAliveInterval = KEEPALIVE_DOZE_MS;
         }
         // Priority 1: Burst mode (position tracking) - Fast response required
@@ -1684,11 +1684,11 @@ public class NotificationService extends Service
             currentKeepAliveInterval = KEEPALIVE_BURST_MODE_MS;
         }
         // Priority 2: Screen on = fast response (user active)
-        else if (isScreenOn) {
+        else if (deviceMonitor.isScreenOn()) {
             currentKeepAliveInterval = KEEPALIVE_SCREEN_ON_MS;
         }
         // Priority 3: Low battery + screen off = ultra conservative
-        else if (deviceMonitor.isLowBattery() && !isScreenOn) {
+        else if (deviceMonitor.isLowBattery() && !deviceMonitor.isScreenOn()) {
             if (deviceMonitor.isDeviceIdle()) {
                 currentKeepAliveInterval = KEEPALIVE_LOW_BATTERY_IDLE_MS;
             } else {
@@ -1700,7 +1700,7 @@ public class NotificationService extends Service
             currentKeepAliveInterval = KEEPALIVE_IDLE_MS;
         }
         // Priority 5: Screen off but not idle
-        else if (!isScreenOn) {
+        else if (!deviceMonitor.isScreenOn()) {
             currentKeepAliveInterval = KEEPALIVE_SCREEN_OFF_MS;
         }
         // Priority 6: Network type (WiFi vs Mobile)
@@ -1747,14 +1747,14 @@ public class NotificationService extends Service
         long now = System.currentTimeMillis();
         boolean inBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
 
-        if (isInDozeMode) {
+        if (deviceMonitor.isInDozeMode()) {
             return "DOZE MODE (deep sleep, 15min intervals)";
         } else if (inBurstMode) {
             long remainingSec = (burstModeEndTime - now) / 1000;
             return "BURST MODE (tracking active, " + remainingSec + "s remaining)";
-        } else if (isScreenOn) {
+        } else if (deviceMonitor.isScreenOn()) {
             return "Screen ON (fast response)";
-        } else if (deviceMonitor.isLowBattery() && !isScreenOn) {
+        } else if (deviceMonitor.isLowBattery() && !deviceMonitor.isScreenOn()) {
             if (deviceMonitor.isDeviceIdle()) {
                 return "LOW BATTERY + IDLE (4min ultra-save)";
             } else {
@@ -1762,7 +1762,7 @@ public class NotificationService extends Service
             }
         } else if (deviceMonitor.isDeviceIdle()) {
             return "Device IDLE (2min battery save)";
-        } else if (!isScreenOn) {
+        } else if (!deviceMonitor.isScreenOn()) {
             return "Screen OFF (90s battery save)";
         } else if (deviceMonitor.isOnWifi()) {
             return "WiFi (60s moderate)";
@@ -1779,7 +1779,7 @@ public class NotificationService extends Service
      */
     private int getSocketTimeout() {
         // Doze mode: longest timeout to minimize wake-ups
-        if (isInDozeMode) {
+        if (deviceMonitor.isInDozeMode()) {
             return SOCKET_TIMEOUT_DOZE_MS;
         }
 
@@ -1797,71 +1797,14 @@ public class NotificationService extends Service
     /**
      * Check if device is currently on WiFi
      */
-    private boolean deviceMonitor.isOnWifi() {
-        try {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                Network activeNetwork = cm.getActiveNetwork();
-                if (activeNetwork == null) return false;
-
-                NetworkCapabilities capabilities = cm.getNetworkCapabilities(activeNetwork);
-                return capabilities != null &&
-                       capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
-            } else {
-                android.net.NetworkInfo networkInfo = cm.getActiveNetworkInfo();
-                return networkInfo != null &&
-                       networkInfo.isConnected() &&
-                       networkInfo.getType() == ConnectivityManager.TYPE_WIFI;
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "KaZaService: Error checking WiFi status: " + e.getMessage());
-            return false;
-        }
-    }
 
     /**
      * Check if device is currently on mobile data
      */
-    private boolean deviceMonitor.isOnMobileData() {
-        try {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                Network activeNetwork = cm.getActiveNetwork();
-                if (activeNetwork == null) return false;
-
-                NetworkCapabilities capabilities = cm.getNetworkCapabilities(activeNetwork);
-                return capabilities != null &&
-                       capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
-            } else {
-                android.net.NetworkInfo networkInfo = cm.getActiveNetworkInfo();
-                return networkInfo != null &&
-                       networkInfo.isConnected() &&
-                       networkInfo.getType() == ConnectivityManager.TYPE_MOBILE;
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "KaZaService: Error checking mobile data status: " + e.getMessage());
-            return false;
-        }
-    }
 
     /**
      * Update idle detection based on time since last activity
      */
-    private void deviceMonitor.updateIdleState() {
-        long idleTime = System.currentTimeMillis() - lastActivityTime;
-        long IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
-
-        boolean wasIdle = deviceMonitor.isDeviceIdle();
-        deviceMonitor.isDeviceIdle() = (idleTime > IDLE_THRESHOLD_MS) && !deviceMonitor.isScreenOn();
-
-        if (wasIdle != deviceMonitor.isDeviceIdle()) {
-            Log.d(TAG, "KaZaService: Idle state changed: " + wasIdle + " → " + deviceMonitor.isDeviceIdle());
-        }
-    }
 
     /**
      * Check and log current App Standby Bucket (API 28+)

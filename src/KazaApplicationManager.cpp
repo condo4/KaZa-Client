@@ -246,6 +246,7 @@ void KazaApplicationManager::suspend()
     // Disconnect asynchronously - don't block UI thread
     m_ssl.disconnectFromHost();
     // Don't wait - let the disconnected signal handle cleanup
+    m_ssl.waitForDisconnected();
 }
 
 void KazaApplicationManager::resume()
@@ -304,7 +305,7 @@ void KazaApplicationManager::_startApplication()
 
 
 void KazaApplicationManager::_disconnected() {
-
+    qInfo().noquote() << "Application DISCONNECTED";
 }
 
 
@@ -608,8 +609,7 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
     }
     else if(command.startsWith("CONNECTED"))
     {
-        qDebug() << "CONNECTED";
-        qInfo().noquote() << "Version negotiation successful - connection ready";
+        qInfo().noquote() << "Application CONNECTED";
 
         m_ready = true;
         emit readyChanged();

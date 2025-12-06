@@ -179,7 +179,7 @@ public class KaZaDeviceStateMonitor {
 
     // ==================== Network Monitoring ====================
 
-    private void registerNetworkReceiver() {
+    public void registerNetworkReceiver() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             try {
                 ConnectivityManager connectivityManager =
