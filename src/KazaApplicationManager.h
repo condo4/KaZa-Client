@@ -34,6 +34,7 @@ class KazaApplicationManager : public QObject
     QString m_appChecksum;
     QString m_appFile;
     QString m_appWanted;
+    QString m_devicename;
 
     bool m_debug {true};
     bool m_configured {false};
@@ -46,6 +47,7 @@ class KazaApplicationManager : public QObject
     QString m_host;
     uint16_t m_port;
     bool m_appStarted {false};
+    bool m_started {false};
 
     static KazaApplicationManager *m_instance;
 
@@ -71,7 +73,7 @@ public:
     void setErrorMsg(const QString &newErrorMsg);
 
 public slots:
-    bool setConfiguration(QString host, uint16_t port, QString clientPassword, QString username);
+    bool setConfiguration(QString host, uint16_t port, QString adminPassword, QString username, QString userPassword);
     void suspend();
     void resume();
     void applicationReday();
@@ -98,7 +100,7 @@ signals:
     void errorMsgChanged();
 
 private:
-    bool _tryConnectClient(const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
+    bool _configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
     void __appStateChange(Qt::ApplicationState state);
     void _calculateAppChecksum();
 

@@ -1,21 +1,32 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(KaZa VERSION 2.3.1 LANGUAGES CXX)
+project(KaZa VERSION 2.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(QT_NO_PRIVATE_MODULE_WARNING ON)
 
 set(VERSION_CODE 240926)
 add_definitions("-DVERSION_CODE=${VERSION_CODE}")
 add_definitions("-DVERSION_NAME=${CMAKE_PROJECT_VERSION}")
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Quick QuickControls2 Network Charts Xml WebView)
+find_package(Qt6 REQUIRED COMPONENTS CorePrivate Quick QuickControls2 Network Charts Xml WebView)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
 if(ANDROID)
     set(PLATFORM_FILES
         android/AndroidManifest.xml
-        android/src/org/kaza/LocalService.java
+        android/build.gradle
+        android/res/values/libs.xml
+        android/res/xml/qtprovider_paths.xml
+        android/gradle/wrapper/gradle-wrapper.jar
+        android/gradle/wrapper/gradle-wrapper.properties
+        android/gradle.properties android/gradlew
+        android/gradlew.bat
+        android/src/org/kaza/NotificationService.java
+        android/src/org/kaza/ServiceBridge.java
+        android/src/org/kaza/BootReceiver.java
+        android/src/org/kaza/KaZaProtocol.java
     )
     include_directories("android")
 endif(ANDROID)
@@ -31,6 +42,9 @@ qt_add_executable(KaZa
     src/kzport.h                    src/kzport.cpp
     protocol/kazaprotocol.h         protocol/kazaprotocol.cpp
     ${PLATFORM_FILES}
+    src/kazanotificationchecker.h src/kazanotificationchecker.cpp
+    src/kazabackend.h src/kazabackend.cpp
+    src/kazaservicebridge.h src/kazaservicebridge.cpp
 )
 
 qt_add_resources(KaZa "KaZa"

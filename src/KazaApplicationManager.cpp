@@ -16,13 +16,22 @@
 #include <QApplication>
 #include <QDomDocument>
 #include <QBuffer>
+#include <QThread>
 
 #include "kazaobject.h"
+#include "kazanotificationchecker.h"
+#include "kazaservicebridge.h"
 
 
 #ifdef ANDROID
     #include <QtCore/private/qandroidextras_p.h>
+    #include <QJniObject>
     #include <jni.h>
+
+// Fonction C++ qui sera appelée par Java
+extern "C" {
+
+}
 #endif
 
 KazaApplicationManager *KazaApplicationManager::m_instance = nullptr;
@@ -36,6 +45,8 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
     QObject::connect(static_cast<QApplication *>(QApplication::instance()), &QApplication::applicationStateChanged, this, &KazaApplicationManager::__appStateChange);
     QObject::connect(&m_ssl, &QSslSocket::encrypted, this, &KazaApplicationManager::_encrypted);
     QObject::connect(&m_protocol, &KaZaProtocol::disconnectFromHost, this, &KazaApplicationManager::_disconnected);
+
+    // Regular protocol signals
     QObject::connect(&m_protocol, &KaZaProtocol::frameCommand, this, &KazaApplicationManager::_processFrameSystem);
     QObject::connect(&m_protocol, &KaZaProtocol::frameFile, this, &KazaApplicationManager::_processFrameFile);
     QObject::connect(&m_protocol, &KaZaProtocol::frameOject, this, &KazaApplicationManager::_processFrameObjectValue);
@@ -81,26 +92,71 @@ KazaApplicationManager::~KazaApplicationManager()
 
 bool KazaApplicationManager::setConfiguration(QString host,
                                               uint16_t port,
-                                              QString clientPassword,
-                                              QString username)
+                                              QString adminPassword,
+                                              QString username,
+                                              QString userPassword)
 {
     QDomDocument xml;
-    QTcpSocket socket;
-    qDebug() << "setConfguration(" + host + ":" + QString::number(port) + ", " + clientPassword + ", " + username +")";
-    socket.connectToHost(host, port);
-    if(!socket.waitForConnected())
+    QSslSocket socket;
+    qDebug() << "setConfiguration(" + host + ":" + QString::number(port) + ", [admin], " + username + ", [userpass])";
+
+    // Configure SSL socket for control port (VerifyNone mode, no client cert required for initial config)
+    QSslConfiguration sslConf = QSslConfiguration::defaultConfiguration();
+    sslConf.setPeerVerifyMode(QSslSocket::VerifyNone); // Control port doesn't require client verification
+    socket.setSslConfiguration(sslConf);
+
+    qDebug() << "Connecting to control port with SSL...";
+    socket.connectToHostEncrypted(host, port);
+    if(!socket.waitForEncrypted(10000)) // Wait up to 10 seconds for SSL handshake
+    {
+        qWarning() << "Failed to connect to control server:" << socket.errorString();
+        setErrorMsg("Failed to connect to server: " + socket.errorString());
         return false;
+    }
+
+    qDebug() << "SSL connection established to control port";
+
+    // Send new protocol command: clientconf? adminpass username userpass
+    QString command = QString("clientconf? %1 %2 %3\n")
+                          .arg(adminPassword)
+                          .arg(username)
+                          .arg(userPassword);
+    socket.write(command.toUtf8());
+    socket.flush();
 
     QByteArray data;
-    socket.write("clientconf?\n");
-
-    while(!data.contains("</param>"))
+    while(!data.contains("</param>") && !data.contains("ERROR:"))
     {
-        socket.waitForReadyRead();
+        if(!socket.waitForReadyRead(5000))
+        {
+            qWarning() << "Timeout waiting for server response";
+            setErrorMsg("Timeout waiting for server response");
+            socket.close();
+            return false;
+        }
         data.append(socket.readAll());
     }
     socket.close();
-    xml.setContent(data);
+
+    // Check for error response
+    if(data.contains("ERROR:"))
+    {
+        QString errorMsg = QString::fromUtf8(data).trimmed();
+        qWarning() << "Server returned error:" << errorMsg;
+        setErrorMsg(errorMsg);
+        return false;
+    }
+
+    qDebug() << "DATA:" << data;
+    auto parseResult = xml.setContent(data);
+    if(!parseResult)
+    {
+        qWarning() << "Failed to parse XML:" << parseResult.errorMessage
+                   << "at line" << parseResult.errorLine
+                   << "column" << parseResult.errorColumn;
+        setErrorMsg("Failed to parse server response: " + parseResult.errorMessage);
+        return false;
+    }
     QString sslhost = xml.elementsByTagName("sslhost").item(0).toElement().text().trimmed();
     QString sslport = xml.elementsByTagName("sslport").item(0).toElement().text().trimmed();
     QString certificate = xml.elementsByTagName("certificate").item(0).toElement().text().trimmed();
@@ -151,9 +207,13 @@ bool KazaApplicationManager::setConfiguration(QString host,
 
     qDebug() << "Configuration registered, try connection";
 
-    if(_tryConnectClient(output.path() + "/client.cert", output.path() + "/ca.cert.pem", output.path() + "/client.key", clientPassword, sslhost, sslport.toInt()) == false)
+
+    if(_configureSslSocket(m_ssl, output.path() + "/client.cert", output.path() + "/ca.cert.pem", output.path() + "/client.key", userPassword, sslhost, sslport.toInt()) == false)
         return false;
-    qDebug() << "Try connection valid";
+
+    qInfo().noquote() << "Kaza try connection to #" + host + "#:" + QString::number(port);
+    m_ssl.connectToHostEncrypted(sslhost, sslport.toInt());
+    qDebug() << "Try connection valid on" << sslhost << sslport.toInt();
 
     if(m_ssl.waitForEncrypted())
     {
@@ -161,9 +221,11 @@ bool KazaApplicationManager::setConfiguration(QString host,
         m_settings.setValue("ssl/cacert", output.path() + "/ca.cert.pem");
         m_settings.setValue("ssl/client_cert", output.path() + "/client.cert");
         m_settings.setValue("ssl/client_key", output.path() + "/client.key");
-        m_settings.setValue("ssl/client_pass", clientPassword);
+        m_settings.setValue("ssl/client_pass", userPassword);
         m_settings.setValue("ssl/host", sslhost);
         m_settings.setValue("ssl/port", sslport);
+        m_settings.setValue("control/host", host);
+        m_settings.setValue("control/port", port);
         m_settings.setValue("username", username);
         setConfigured(true);
         emit loginChanged();
@@ -171,7 +233,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
     }
     else
     {
-        qWarning() << "Connection SSL Failed" << m_ssl.errorString();
+        qWarning() << "Connection SSL Failed" << m_ssl.errorString() << sslhost;
         return false;
     }
 
@@ -180,51 +242,51 @@ bool KazaApplicationManager::setConfiguration(QString host,
 
 void KazaApplicationManager::suspend()
 {
+    qDebug() << "KazaApplicationManager: Suspending - disconnecting from host";
+    // Disconnect asynchronously - don't block UI thread
     m_ssl.disconnectFromHost();
-    m_ssl.waitForDisconnected();
+    // Don't wait - let the disconnected signal handle cleanup
 }
 
 void KazaApplicationManager::resume()
 {
-    qDebug() << "Resume";
+    qDebug() << "KazaApplicationManager: Resuming application";
+
+    // Check if we're not already connected
     if(!m_ssl.isEncrypted())
     {
-        m_ssl.connectToHostEncrypted(m_host, m_port);
-        m_ssl.waitForConnected();
+        qDebug() << "KazaApplicationManager: Not connected - reconnecting to" << m_host << ":" << m_port;
 
-        for(KaZaObject *obj: m_instance->m_kobjects)
-        {
-            if(obj->refcount())
-            {
-                m_protocol.sendCommand("OBJ:" + obj->name() + ":" + QString::number(m_instance->m_kobjects.indexOf(obj)));
-            }
-        }
+        // Connect asynchronously - don't block UI thread
+        m_ssl.connectToHostEncrypted(m_host, m_port);
+
+        // Don't wait for connection! Let the encrypted signal handler deal with it
+        // The _encrypted() slot will handle re-registering objects when connected
+
+        // Note: Object registration moved to _encrypted() handler to ensure
+        // it only happens after successful connection, not blocking UI
+    }
+    else
+    {
+        qDebug() << "KazaApplicationManager: Already connected, no reconnection needed";
     }
 }
 
 void KazaApplicationManager::applicationReday()
 {
     qDebug() << "Application ready";
-#ifdef ANDROID_DISABLED
-    auto activity = QJniObject(QNativeInterface::QAndroidApplication::context());
-    QAndroidIntent serviceIntent(activity.object(), "org/kaza/LocalService");
-    QJniObject result = activity.callObjectMethod(
-        "startService",
-        "(Landroid/content/Intent;)Landroid/content/ComponentName;",
-        serviceIntent.handle().object());
-#endif
 }
 
 void KazaApplicationManager::_encrypted()
 {
-    qInfo().noquote() << "KaZa is connected";
+    qInfo().noquote() << "SSL connected - starting version negotiation";
 
-    m_ready = true;
     m_secured = true;
-    emit readyChanged();
     emit securedChanged();
     emit connectedChanged(m_ssl.isEncrypted());
-    m_protocol.sendCommand("USER:" + m_settings.value("username").toString());
+
+    // Send version as FIRST frame after SSL handshake
+    m_protocol.sendVersion(m_settings.value("username").toString(), m_devicename, 1);
 }
 
 void KazaApplicationManager::_startApplication()
@@ -236,6 +298,7 @@ void KazaApplicationManager::_startApplication()
     }
     QResource::registerResource(m_appFile, "/application");
     m_homepage = "qrc:/application/main.qml";
+    m_started = true;
     emit homepageChanged();
 }
 
@@ -243,6 +306,7 @@ void KazaApplicationManager::_startApplication()
 void KazaApplicationManager::_disconnected() {
 
 }
+
 
 void KazaApplicationManager::_sendObject(QVariant value, bool confirm)
 {
@@ -253,7 +317,7 @@ void KazaApplicationManager::_sendObject(QVariant value, bool confirm)
     m_protocol.sendObject(m_kobjects.indexOf(obj), value, confirm);
 }
 
-bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port)
+bool KazaApplicationManager::_configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port)
 {
 
     QFile caCertFile(FILEPATH(caCert));
@@ -297,9 +361,8 @@ bool KazaApplicationManager::_tryConnectClient(const QString &clientCert, const 
     if(m_debug) sslConf.setPeerVerifyMode(QSslSocket::VerifyNone);
 
 
-    m_ssl.setSslConfiguration(sslConf);
-    qInfo().noquote() << "Kaza try connection to #" + host + "#:" + QString::number(port);
-    m_ssl.connectToHostEncrypted(host, port);
+    ssl.setSslConfiguration(sslConf);
+
     return true;
 }
 
@@ -333,14 +396,60 @@ void KazaApplicationManager::setConfigured(bool newConfigured)
 void KazaApplicationManager::connectClient()
 {
     qDebug() << "connectClient";
+
     QString clientCert = m_settings.value("ssl/client_cert").toString();
     QString caCert = m_settings.value("ssl/cacert").toString();
     QString clientKey = m_settings.value("ssl/client_key").toString();
     QString clientPassword = m_settings.value("ssl/client_pass").toString();
     m_host = m_settings.value("ssl/host").toString();
     m_port = m_settings.value("ssl/port").toUInt();
+    QString user = m_instance->m_settings.value("username").toString();
 
-    _tryConnectClient(clientCert, caCert, clientKey, clientPassword, m_host, m_port);
+#ifdef ANDROID
+    // Configure NotificationService with SSL parameters
+    qDebug() << "=== Configuring NotificationService ===";
+    KazaServiceBridge bridge;
+
+    // Get device name from Android Build.MODEL
+    QJniObject buildModel = QJniObject::getStaticObjectField(
+        "android/os/Build",
+        "MODEL",
+        "Ljava/lang/String;"
+    );
+    m_devicename = buildModel.toString();
+    qDebug() << "Device model:" << m_devicename;
+
+    // Test communication first
+    QString response = bridge.queryNotificationService("Connection");
+    qDebug() << "Service bridge response:" << response;
+    if (response == "OK") {
+        qDebug() << "✓ Service communication successful";
+
+        // Send configuration to service
+        bool configured = bridge.configureService(clientCert, caCert, clientKey,
+                                                   clientPassword, m_host, m_port, user);
+        if (configured) {
+            qDebug() << "✓ Service configured successfully";
+
+            // Verify configuration
+            QString configCheck = bridge.queryNotificationService("config");
+            qDebug() << "Service configuration:" << configCheck;
+        } else {
+            qWarning() << "✗ Service configuration failed";
+        }
+    } else {
+        qWarning() << "✗ Service communication failed:" << response;
+    }
+#else
+    // Set device name for non-Android platforms
+    m_devicename = "Desktop";
+    qDebug() << "Device model:" << m_devicename;
+#endif
+
+    _configureSslSocket(m_ssl, clientCert, caCert, clientKey, clientPassword, m_host, m_port);
+
+    qInfo().noquote() << "Kaza try connection to #" + m_host + "#:" + QString::number(m_port);
+    m_ssl.connectToHostEncrypted(m_host, m_port);
 }
 
 bool KazaApplicationManager::connected() const
@@ -394,6 +503,8 @@ void KazaApplicationManager::putKaZaObject(KaZaObject *obj)
 KaZaProtocol *KazaApplicationManager::protocol() {
     return &m_instance->m_protocol;
 }
+
+
 
 bool KazaApplicationManager::debug() const
 {
@@ -458,24 +569,27 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
 {
     if(command.startsWith("APP:"))
     {
-        if(m_settings.contains("Client/debug"))
+        if(!m_started)
         {
-            m_homepage = "file://" + m_settings.value("Client/debug").toString() + "/main.qml";
-            qDebug() << "USE DEBUG APPLICATION " << m_homepage;
-            emit homepageChanged();
-            return;
-        }
+            if(m_settings.contains("Client/debug"))
+            {
+                m_homepage = "file://" + m_settings.value("Client/debug").toString() + "/main.qml";
+                qDebug() << "USE DEBUG APPLICATION " << m_homepage;
+                emit homepageChanged();
+                return;
+            }
 
-        QStringList c = command.split(":");
-        m_appWanted = c[1];
-        if(c[1] != m_appChecksum)
-        {
-            qDebug() << "Need to download new version of application";
-            m_protocol.sendCommand("APP?");
-        }
-        else
-        {
-            _startApplication();
+            QStringList c = command.split(":");
+            m_appWanted = c[1];
+            if(c[1] != m_appChecksum)
+            {
+                qDebug() << "Need to download new version of application";
+                m_protocol.sendCommand("APP?");
+            }
+            else
+            {
+                _startApplication();
+            }
         }
     }
     else if(command.startsWith("OBJDESC"))
@@ -489,6 +603,25 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
                 {
                     obj->setUnit(desc[2]);
                 }
+            }
+        }
+    }
+    else if(command.startsWith("CONNECTED"))
+    {
+        qDebug() << "CONNECTED";
+        qInfo().noquote() << "Version negotiation successful - connection ready";
+
+        m_ready = true;
+        emit readyChanged();
+
+        // Re-register all referenced objects (for resume after sleep)
+        // This ensures the server knows about objects that were previously registered
+        for(KaZaObject *obj: m_instance->m_kobjects)
+        {
+            if(obj->refcount())
+            {
+                qDebug() << "KazaApplicationManager: Re-registering object:" << obj->name();
+                m_protocol.sendCommand("OBJ:" + obj->name() + ":" + QString::number(m_instance->m_kobjects.indexOf(obj)));
             }
         }
     }

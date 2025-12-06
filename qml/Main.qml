@@ -5,8 +5,8 @@ import QtWebView
 
 ApplicationWindow {
     id: mainwindow
-    width: 640
-    height: 480
+    width: 1080/2.5
+    height: 2030/2.5
     visible: true
     title: qsTr("KaZa")
 
