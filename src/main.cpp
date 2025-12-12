@@ -8,7 +8,6 @@
 #include "kzobject.h"
 #include "kzhistory.h"
 #include "kzport.h"
-#include "kazaservicebridge.h"
 #include <QtWebView>
 
 #define xstr(s) str(s)
@@ -45,7 +44,6 @@ int main(int argc, char *argv[])
 
     QQmlApplicationEngine engine;
     KazaApplicationManager manager;
-    KazaServiceBridge serviceBridge;
     QQuickStyle::setStyle("Material");
 
     qmlRegisterType<KzObject>("org.kazoe.kaza", 1, 0, "KzObject");
@@ -53,7 +51,6 @@ int main(int argc, char *argv[])
     qmlRegisterType<KzPort>("org.kazoe.kaza", 1, 0, "KzPort");
     engine.rootContext()->setContextProperty("manager", &manager);
     engine.rootContext()->setContextProperty("knxiface", &manager); // For QML compatibility with KaZa 1.0
-    engine.rootContext()->setContextProperty("serviceBridge", &serviceBridge);
     engine.rootContext()->setContextProperty("version", version);
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
         &app, []() { QCoreApplication::exit(-1); },

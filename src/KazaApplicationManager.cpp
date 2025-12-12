@@ -20,7 +20,6 @@
 
 #include "kazaobject.h"
 #include "kazanotificationchecker.h"
-#include "kazaservicebridge.h"
 
 
 #ifdef ANDROID
@@ -407,9 +406,8 @@ void KazaApplicationManager::connectClient()
     QString user = m_instance->m_settings.value("username").toString();
 
 #ifdef ANDROID
-    // Configure NotificationService with SSL parameters
+    // Configure NotificationService with SSL parameters via Intent
     qDebug() << "=== Configuring NotificationService ===";
-    KazaServiceBridge bridge;
 
     // Get device name from Android Build.MODEL
     QJniObject buildModel = QJniObject::getStaticObjectField(
@@ -420,27 +418,71 @@ void KazaApplicationManager::connectClient()
     m_devicename = buildModel.toString();
     qDebug() << "Device model:" << m_devicename;
 
-    // Test communication first
-    QString response = bridge.queryNotificationService("Connection");
-    qDebug() << "Service bridge response:" << response;
-    if (response == "OK") {
-        qDebug() << "✓ Service communication successful";
+    // Get Android context
+    QJniObject activity = QNativeInterface::QAndroidApplication::context();
 
-        // Send configuration to service
-        bool configured = bridge.configureService(clientCert, caCert, clientKey,
-                                                   clientPassword, m_host, m_port, user);
-        if (configured) {
-            qDebug() << "✓ Service configured successfully";
+    // Get the NotificationService class
+    QJniObject serviceClass = activity.callObjectMethod("getClassLoader",
+                                                        "()Ljava/lang/ClassLoader;")
+                                     .callObjectMethod("loadClass",
+                                                      "(Ljava/lang/String;)Ljava/lang/Class;",
+                                                      QJniObject::fromString("org.kaza.NotificationService").object());
 
-            // Verify configuration
-            QString configCheck = bridge.queryNotificationService("config");
-            qDebug() << "Service configuration:" << configCheck;
-        } else {
-            qWarning() << "✗ Service configuration failed";
-        }
-    } else {
-        qWarning() << "✗ Service communication failed:" << response;
-    }
+    // Create Intent to configure the service
+    QJniObject intent("android/content/Intent",
+                      "(Landroid/content/Context;Ljava/lang/Class;)V",
+                      activity.object(),
+                      serviceClass.object());
+
+    // Add configuration as Intent extras
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ACTION").object(),
+                           QJniObject::fromString("CONFIGURE").object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_client_cert").object(),
+                           QJniObject::fromString(clientCert).object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_ca_cert").object(),
+                           QJniObject::fromString(caCert).object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_client_key").object(),
+                           QJniObject::fromString(clientKey).object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_client_pass").object(),
+                           QJniObject::fromString(clientPassword).object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_host").object(),
+                           QJniObject::fromString(m_host).object());
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;I)Landroid/content/Intent;",
+                           QJniObject::fromString("ssl_port").object(),
+                           m_port);
+
+    intent.callObjectMethod("putExtra",
+                           "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                           QJniObject::fromString("username").object(),
+                           QJniObject::fromString(user).object());
+
+    // Start the service with configuration
+    activity.callObjectMethod("startService",
+                             "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+                             intent.object());
+
+    qDebug() << "✓ Service configuration sent via Intent";
+    qDebug() << "  Host:" << m_host << ":" << m_port;
+    qDebug() << "  Username:" << user;
 #else
     // Set device name for non-Android platforms
     m_devicename = "Desktop";

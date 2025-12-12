@@ -387,12 +387,12 @@ public class NotificationService extends Service
                 Log.i(TAG, "KaZaService: Location permissions - Fine: " + hasFineLocation + ", Coarse: " + hasCoarseLocation);
             }
 
-            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING;
             if (hasLocationPermission) {
                 serviceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
-                Log.i(TAG, "KaZaService: Starting with DATA_SYNC + LOCATION service types");
+                Log.i(TAG, "KaZaService: Starting with REMOTE_MESSAGING + LOCATION service types");
             } else {
-                Log.w(TAG, "KaZaService: Location permission not granted - starting with DATA_SYNC only");
+                Log.w(TAG, "KaZaService: Location permission not granted - starting with REMOTE_MESSAGING only");
                 Log.w(TAG, "KaZaService: GPS features will not be available until location permission is granted");
             }
 
@@ -559,6 +559,51 @@ public class NotificationService extends Service
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "KaZaService: onStartCommand called");
         Log.i(TAG, "KaZaService: Service running in PID: " + android.os.Process.myPid());
+
+        // Handle configuration via Intent extras (works across processes)
+        if (intent != null && intent.hasExtra("ACTION")) {
+            String action = intent.getStringExtra("ACTION");
+            Log.i(TAG, "KaZaService: Received action: " + action);
+
+            if ("CONFIGURE".equals(action)) {
+                // Extract SSL configuration from intent extras
+                String clientCert = intent.getStringExtra("ssl_client_cert");
+                String caCert = intent.getStringExtra("ssl_ca_cert");
+                String clientKey = intent.getStringExtra("ssl_client_key");
+                String clientPass = intent.getStringExtra("ssl_client_pass");
+                String host = intent.getStringExtra("ssl_host");
+                int port = intent.getIntExtra("ssl_port", 0);
+                String user = intent.getStringExtra("username");
+
+                if (clientCert != null && caCert != null && clientKey != null &&
+                    host != null && port > 0 && user != null) {
+
+                    Log.i(TAG, "KaZaService: Configuring service via Intent");
+                    Log.i(TAG, "KaZaService: Host: " + host + ":" + port);
+                    Log.i(TAG, "KaZaService: Username: " + user);
+
+                    // Store configuration
+                    this.sslClientCert = clientCert;
+                    this.sslCaCert = caCert;
+                    this.sslClientKey = clientKey;
+                    this.sslClientPass = clientPass;
+                    this.sslHost = host;
+                    this.sslPort = port;
+                    this.username = user;
+                    this.configured = true;
+
+                    // Save to SharedPreferences for persistence
+                    saveConfiguration();
+
+                    Log.i(TAG, "KaZaService: Configuration stored successfully");
+
+                    // Connect to server
+                    connectToServer();
+                } else {
+                    Log.w(TAG, "KaZaService: Invalid configuration in Intent - missing parameters");
+                }
+            }
+        }
 
         // START_STICKY ensures Android will restart the service if killed
         return START_STICKY;
@@ -1384,15 +1429,6 @@ public class NotificationService extends Service
                 case "CONNECTED":
                     Log.i(TAG, "KaZaService: ✓ Version negotiation successful - connection established");
                     // Protocol is now ready - connection fully established
-
-                    // Send initial position
-                    position = tracker.getGPSPosition(burstModeEndTime, deviceMonitor.isScreenOn());
-                    try {
-                        protocol.sendCommand("POSITION:" + position);
-                        Log.i(TAG, "KaZaService: Sent initial position: " + position);
-                    } catch (Exception e) {
-                        Log.e(TAG, "KaZaService: Failed to send position: " + e.getMessage());
-                    }
 
                     // Start automatic position tracking (battery-efficient)
                     tracker.startAutomaticPositionTracking();

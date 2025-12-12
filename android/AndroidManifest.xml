@@ -17,9 +17,12 @@
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/qtprovider_paths"/>
         </provider>
 
-        <service android:name=".NotificationService" android:exported="true" android:foregroundServiceType="dataSync|location">
-            <!-- Background running with location access -->
-            <!-- TODO: Implement proper IPC (AIDL/Messenger) to enable separate process -->
+        <service android:name=".NotificationService" android:process=":notification" android:exported="true" android:foregroundServiceType="location|remoteMessaging">
+            <!-- Background running with location access and remote messaging -->
+            <!-- Runs in separate process for isolation and stability -->
+            <!-- Configuration via Intent extras (works across processes) -->
+            <!-- remoteMessaging: Receives push notifications from KaZa server -->
+            <!-- location: Tracks and sends GPS position on demand -->
             <meta-data android:name="android.app.background_running" android:value="true"/>
         </service>
         <!-- Receiver pour redémarrer le service au démarrage de l'appareil -->
@@ -44,5 +47,5 @@
 <uses-permission android:name="android.permission.WAKE_LOCK"/>
 <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING"/>
 </manifest>

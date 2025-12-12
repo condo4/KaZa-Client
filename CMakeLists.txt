@@ -24,7 +24,6 @@ if(ANDROID)
         android/gradle.properties android/gradlew
         android/gradlew.bat
         android/src/org/kaza/NotificationService.java
-        android/src/org/kaza/ServiceBridge.java
         android/src/org/kaza/BootReceiver.java
         android/src/org/kaza/KaZaProtocol.java
         android/src/org/kaza/KaZaTracker.java
@@ -46,7 +45,6 @@ qt_add_executable(KaZa
     ${PLATFORM_FILES}
     src/kazanotificationchecker.h src/kazanotificationchecker.cpp
     src/kazabackend.h src/kazabackend.cpp
-    src/kazaservicebridge.h src/kazaservicebridge.cpp
 )
 
 qt_add_resources(KaZa "KaZa"
