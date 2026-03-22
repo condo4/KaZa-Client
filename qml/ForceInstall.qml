@@ -1,7 +1,10 @@
-import QtQuick 2.7
-import QtQuick.Window 2.2
-import QtQuick.Controls 2.0
-import QtCharts 2.15
+import QtQuick
+import QtQuick.Window
+import QtQuick.Controls
+import QtCharts
+import QtPositioning
+import QtLocation
+import Qt.labs.animation
 
 Item {
 

@@ -41,7 +41,9 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
     , m_configured(m_settings.value("configured").toBool())
     , m_homepage("Homepage.qml")
 {
+    #ifdef ANDROID
     QObject::connect(static_cast<QApplication *>(QApplication::instance()), &QApplication::applicationStateChanged, this, &KazaApplicationManager::__appStateChange);
+    #endif
     QObject::connect(&m_ssl, &QSslSocket::encrypted, this, &KazaApplicationManager::_encrypted);
     QObject::connect(&m_protocol, &KaZaProtocol::disconnectFromHost, this, &KazaApplicationManager::_disconnected);
 
