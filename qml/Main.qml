@@ -1,6 +1,6 @@
 import QtQuick
 import QtQuick.Window
-import QtQuick.Controls
+import QtQuick.Controls.Material
 import QtWebView
 
 ApplicationWindow {
@@ -27,6 +27,15 @@ ApplicationWindow {
             id: homepage
             source: mainwindow.configured ? mainwindow.homepage  : "Configuration.qml"
         }
+    }
+
+    // Qt >= 6.12 no longer sends a close request on Android Back: if nobody accepts the key it
+    // just moves the task to the background. Accept it here and go through onClosing, so the
+    // client application's callBackClose (stack pop, or let the window close) still applies.
+    Shortcut {
+        sequences: ["Back"]
+        context: Qt.ApplicationShortcut
+        onActivated: mainwindow.close()
     }
 
     onClosing: function(close) {

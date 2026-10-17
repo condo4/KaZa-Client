@@ -1,15 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(KaZa VERSION 2.5.2 LANGUAGES CXX)
+project(KaZa VERSION 3.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(QT_NO_PRIVATE_MODULE_WARNING ON)
 
-set(VERSION_CODE 2512206)
+set(VERSION_CODE 2610151)
 add_definitions("-DVERSION_CODE=${VERSION_CODE}")
 add_definitions("-DVERSION_NAME=${CMAKE_PROJECT_VERSION}")
 
-find_package(Qt6 REQUIRED COMPONENTS CorePrivate Quick QuickControls2 Network Charts Xml WebView Positioning Location)
+find_package(Qt6 REQUIRED COMPONENTS CorePrivate Quick QuickControls2 Network Xml WebView Positioning Location)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -24,7 +24,11 @@ if(ANDROID)
         android/gradle.properties android/gradlew
         android/gradlew.bat
         android/src/org/kaza/NotificationService.java
+        android/src/org/kaza/PermissionActivity.java
+        android/src/org/kaza/KaZaActivity.java
+        android/res/drawable/ic_stat_kaza.xml
         android/src/org/kaza/BootReceiver.java
+        android/src/org/kaza/KaZaHeartbeatReceiver.java
         android/src/org/kaza/KaZaProtocol.java
         android/src/org/kaza/KaZaTracker.java
         android/src/org/kaza/KaZaDeviceStateMonitor.java
@@ -38,6 +42,7 @@ qt_add_executable(KaZa
     src/KazaApplicationManager.h	src/KazaApplicationManager.cpp
     src/kzobject.h                  src/kzobject.cpp
     src/kzhistory.h                 src/kzhistory.cpp
+    src/kzevolution.h               src/kzevolution.cpp
     src/kazaobject.h                src/kazaobject.cpp
     src/dbquery.h                   src/dbquery.cpp
     src/kzport.h                    src/kzport.cpp
@@ -47,20 +52,31 @@ qt_add_executable(KaZa
     src/kazabackend.h src/kazabackend.cpp
 )
 
-qt_add_resources(KaZa "KaZa"
-    PREFIX "/"
-    FILES
+# The client's own QML is a QML module: qmlcachegen compiles every file ahead of time (byte code and
+# native code for the bindings it fully understands) into the executable, so nothing has to be parsed
+# or compiled at startup, and syntax errors show up at build time. NO_RESOURCE_TARGET_PATH keeps
+# the historical qrc:/qml/*.qml URLs (the downloaded user application is loaded separately, from app.rcc).
+qt_add_qml_module(KaZa
+    URI KaZaClient
+    VERSION 1.0
+    RESOURCE_PREFIX "/"
+    NO_RESOURCE_TARGET_PATH
+    NO_PLUGIN
+    QML_FILES
         qml/Main.qml
         qml/Configuration.qml
         qml/Homepage.qml
-        qml/ForceInstall.qml
         qml/KazaSettings.qml
+        qml/ForceInstall.qml
 )
+# ForceInstall.qml only exists so that the deployment tools pick up the QML modules used by the
+# downloaded applications; it is never instantiated, no need to compile it.
+set_source_files_properties(qml/ForceInstall.qml PROPERTIES QT_QML_SKIP_CACHEGEN TRUE)
 
 target_include_directories(KaZa PUBLIC protocol/)
 
 target_link_libraries(KaZa
-    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Charts Qt6::Xml Qt6::CorePrivate Qt6::WebView Qt6::Positioning Qt6::Location
+    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Xml Qt6::CorePrivate Qt6::WebView Qt6::Positioning Qt6::Location
 )
 
 if (ANDROID)

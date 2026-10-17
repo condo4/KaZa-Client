@@ -13,7 +13,7 @@
 #include <QDirIterator>
 #include <QEventLoop>
 #include <QCryptographicHash>
-#include <QApplication>
+#include <QGuiApplication>
 #include <QDomDocument>
 #include <QBuffer>
 #include <QThread>
@@ -42,10 +42,16 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
     , m_homepage("Homepage.qml")
 {
     #ifdef ANDROID
-    QObject::connect(static_cast<QApplication *>(QApplication::instance()), &QApplication::applicationStateChanged, this, &KazaApplicationManager::__appStateChange);
+    QObject::connect(qGuiApp, &QGuiApplication::applicationStateChanged, this, &KazaApplicationManager::__appStateChange);
     #endif
     QObject::connect(&m_ssl, &QSslSocket::encrypted, this, &KazaApplicationManager::_encrypted);
     QObject::connect(&m_protocol, &KaZaProtocol::disconnectFromHost, this, &KazaApplicationManager::_disconnected);
+
+    m_pingTimer.setInterval(25000);
+    QObject::connect(&m_pingTimer, &QTimer::timeout, this, &KazaApplicationManager::_pingTimeout);
+
+    m_reconnectTimer.setSingleShot(true);
+    QObject::connect(&m_reconnectTimer, &QTimer::timeout, this, &KazaApplicationManager::resume);
 
     // Regular protocol signals
     QObject::connect(&m_protocol, &KaZaProtocol::frameCommand, this, &KazaApplicationManager::_processFrameSystem);
@@ -59,7 +65,15 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
         }
     });
 
-    QObject::connect(&m_ssl, &QSslSocket::peerVerifyError, [this](const QSslError &error){
+    // Connection refused / timeout / host unreachable never reach the protocol's disconnect
+    // signal: without this the client waits forever after a server restart
+    QObject::connect(&m_ssl, &QAbstractSocket::errorOccurred, this, [this](QAbstractSocket::SocketError error){
+        qWarning() << "KazaApplicationManager: Socket error" << error << m_ssl.errorString();
+        if(m_ssl.state() == QAbstractSocket::UnconnectedState && m_appState != Qt::ApplicationSuspended)
+            _scheduleReconnect();
+    });
+
+    QObject::connect(&m_ssl, &QSslSocket::peerVerifyError,[this](const QSslError &error){
         qDebug() << "SSL Verify ERROR: " << error;
     });
 
@@ -148,7 +162,6 @@ bool KazaApplicationManager::setConfiguration(QString host,
         return false;
     }
 
-    qDebug() << "DATA:" << data;
     auto parseResult = xml.setContent(data);
     if(!parseResult)
     {
@@ -244,10 +257,10 @@ bool KazaApplicationManager::setConfiguration(QString host,
 void KazaApplicationManager::suspend()
 {
     qDebug() << "KazaApplicationManager: Suspending - disconnecting from host";
+    m_pingTimer.stop();
+    m_reconnectTimer.stop();
     // Disconnect asynchronously - don't block UI thread
     m_ssl.disconnectFromHost();
-    // Don't wait - let the disconnected signal handle cleanup
-    m_ssl.waitForDisconnected();
 }
 
 void KazaApplicationManager::resume()
@@ -283,6 +296,9 @@ void KazaApplicationManager::_encrypted()
 {
     qInfo().noquote() << "SSL connected - starting version negotiation";
 
+    m_reconnectAttempts = 0;
+    m_reconnectTimer.stop();
+
     m_secured = true;
     emit securedChanged();
     emit connectedChanged(m_ssl.isEncrypted());
@@ -307,6 +323,37 @@ void KazaApplicationManager::_startApplication()
 
 void KazaApplicationManager::_disconnected() {
     qInfo().noquote() << "Application DISCONNECTED";
+
+    m_pingTimer.stop();
+    m_pongPending = false;
+
+    if(m_secured) { m_secured = false; emit securedChanged(); }
+    if(m_ready)   { m_ready = false; emit readyChanged(); }
+    emit connectedChanged(false);
+
+    if(m_appState != Qt::ApplicationSuspended)
+        _scheduleReconnect();
+}
+
+void KazaApplicationManager::_scheduleReconnect()
+{
+    m_reconnectAttempts++;
+    int delay = qMin(60000, 2000 * (1 << qMin(m_reconnectAttempts - 1, 5)));
+    qInfo() << "KazaApplicationManager: Reconnecting in" << delay << "ms (attempt" << m_reconnectAttempts << ")";
+    m_reconnectTimer.start(delay);
+}
+
+void KazaApplicationManager::_pingTimeout()
+{
+    if(m_pongPending)
+    {
+        qWarning() << "KazaApplicationManager: No PONG received - connection considered dead";
+        m_pingTimer.stop();
+        m_ssl.abort();
+        return;
+    }
+    m_pongPending = true;
+    m_protocol.sendCommand("PING");
 }
 
 
@@ -364,13 +411,16 @@ bool KazaApplicationManager::_configureSslSocket(QSslSocket &ssl, const QString 
 
 
     ssl.setSslConfiguration(sslConf);
+    ssl.setSocketOption(QAbstractSocket::KeepAliveOption, 1);
 
     return true;
 }
 
 void KazaApplicationManager::__appStateChange(Qt::ApplicationState state)
 {
-    if(state == Qt::ApplicationInactive)
+    m_appState = state;
+
+    if(state == Qt::ApplicationSuspended)
     {
         suspend();
     }
@@ -658,6 +708,9 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
         m_ready = true;
         emit readyChanged();
 
+        m_pongPending = false;
+        m_pingTimer.start();
+
         // Re-register all referenced objects (for resume after sleep)
         // This ensures the server knows about objects that were previously registered
         for(KaZaObject *obj: m_instance->m_kobjects)
@@ -668,6 +721,10 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
                 m_protocol.sendCommand("OBJ:" + obj->name() + ":" + QString::number(m_instance->m_kobjects.indexOf(obj)));
             }
         }
+    }
+    else if(command == "PONG")
+    {
+        m_pongPending = false;
     }
     else
     {
@@ -692,7 +749,7 @@ void KazaApplicationManager::_processFrameFile(const QString &fileid, QByteArray
 
 
 void KazaApplicationManager::_processFrameObjectValue(quint16 id, QVariant value) {
-    if(id > m_kobjects.size())
+    if(id >= m_kobjects.size())
     {
         qWarning() << "Invalid FrameObject " << id << "with" << value;
         return;

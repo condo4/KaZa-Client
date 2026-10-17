@@ -1,8 +1,10 @@
 package org.kaza;
 
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.NotificationChannel;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.pm.ServiceInfo;
@@ -17,6 +19,8 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
+import android.os.SystemClock;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -28,7 +32,12 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.FileInputStream;
 import java.io.FileReader;
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.security.KeyFactory;
 import java.security.KeyStore;
 import java.security.MessageDigest;
@@ -52,19 +61,16 @@ import javax.net.ssl.TrustManagerFactory;
  * Pure Java foreground service for background tasks
  * No Qt dependencies - can run independently of main app
  *
- * Future features to implement:
- * - AlarmManager for periodic task execution
- * - SSL socket connection to KaZaServer
+ * Keeps one mTLS connection to KaZa-Server. While the CPU sleeps, an AlarmManager heartbeat
+ * (KaZaHeartbeatReceiver) wakes it up under a partial wake lock to PING or reconnect.
  */
 public class NotificationService extends Service
 {
     private static final String TAG = "NotificationService";
     private static final int NOTIFICATION_ID = 1001; // ID for foreground service notification
-    private static final int USER_NOTIFICATION_ID_BASE = 2000; // Base ID for user notifications
     private static final String PREFS_NAME = "NotificationServicePrefs";
 
     private static NotificationService instance = null;
-    private int notificationIdCounter = USER_NOTIFICATION_ID_BASE;
 
     // SSL Configuration
     private String sslClientCert = null;
@@ -76,21 +82,48 @@ public class NotificationService extends Service
     private String username = null;
     private boolean configured = false;
 
-    // SSL Connection
-    private SSLSocket sslSocket = null;
-    private boolean isConnected = false;
-    private KaZaProtocol protocol = null;
+    // SSL Connection.
+    // State transitions happen on connectionHandler. `conn` is the only live connection and is
+    // identified by a generation number: callbacks of a closed connection (reader thread, timers)
+    // are ignored instead of tearing down its successor.
+    private static final int CONNECT_TIMEOUT_MS = 10000;
+    private static final int HANDSHAKE_TIMEOUT_MS = 15000;
+    private static final int PONG_TIMEOUT_MS = 20000;
+    private static final int PONG_LATE_GRACE_MS = 5000;           // timer fired late (device was asleep)
+    private static final int CONFIG_ERROR_RETRY_MS = 5 * 60 * 1000;
+
+    private enum State { DISCONNECTED, CONNECTING, CONNECTED }
+
+    private static class Conn {
+        final int generation;
+        final SSLSocket socket;
+        final KaZaProtocol protocol;
+        final Network network;          // default network at connection time
+        volatile boolean closed = false;
+
+        Conn(int generation, SSLSocket socket, KaZaProtocol protocol, Network network) {
+            this.generation = generation;
+            this.socket = socket;
+            this.protocol = protocol;
+            this.network = network;
+        }
+    }
+
+    private volatile State state = State.DISCONNECTED;
+    private volatile Conn conn = null;
+    private volatile boolean isConnected = false;
+    private int connGeneration = 0;
     private HandlerThread connectionThread = null;
     private Handler connectionHandler = null;
-    private HandlerThread readerThread = null;
-    private Handler readerHandler = null;
+    private final ExecutorService positionExecutor = Executors.newSingleThreadExecutor();
 
-    // Reconnection state
+    // Reconnection state: never gives up, only slows down
     private int reconnectAttempts = 0;
-    private static final int MAX_RECONNECT_ATTEMPTS = 10;
     private static final int RECONNECT_BASE_DELAY_MS = 2000; // 2 seconds
     private static final int RECONNECT_MAX_DELAY_MS = 60000; // 60 seconds
     private Runnable reconnectRunnable = null;
+    private volatile String lastError = null;
+    private volatile boolean configError = false;
 
     // Keep-alive - Adaptive intervals for battery optimization
     private static final int KEEPALIVE_SCREEN_ON_MS = 10000;      // 10s when screen is on (fast response)
@@ -107,18 +140,13 @@ public class NotificationService extends Service
     private static final int LOW_BATTERY_THRESHOLD = 15;                    // Battery percentage threshold
     private static final int BATTERY_RESTORE_THRESHOLD = 20;                // Restore normal behavior above this
 
-    // Socket timeout - Dynamic based on device state for battery optimization
-    private static final int SOCKET_TIMEOUT_ACTIVE_MS = 30000;     // 30s when active (screen on/burst)
-    private static final int SOCKET_TIMEOUT_SCREEN_OFF_MS = 60000; // 60s when screen off
-    private static final int SOCKET_TIMEOUT_DOZE_MS = 90000;       // 90s in Doze mode
-
     // Burst mode - Fast response after position request for 2 minutes
     private static final long BURST_MODE_DURATION_MS = 2 * 60 * 1000; // 2 minutes initial
     private static final long BURST_MODE_MAX_DURATION_MS = 5 * 60 * 1000; // 5 minutes max
     private static final long BURST_MODE_EXTENSION_MS = 1 * 60 * 1000; // Extend by 1 minute
     private static final long BURST_MODE_IDLE_TIMEOUT_MS = 30000; // Exit if no request for 30s
-    private long burstModeEndTime = 0; // Timestamp when burst mode ends (0 = disabled)
-    private long burstModeStartTime = 0; // Timestamp when burst mode started
+    private volatile long burstModeEndTime = 0; // Timestamp when burst mode ends (0 = disabled)
+    private volatile long burstModeStartTime = 0; // Timestamp when burst mode started
 
     // GPS/Location tracker
     private KaZaTracker tracker = null;
@@ -128,8 +156,24 @@ public class NotificationService extends Service
     private Handler keepAliveHandler = null;
 
     // Connection health monitoring
-    private long lastMessageReceivedTime = System.currentTimeMillis();
-    private static final int MAX_NO_RESPONSE_CYCLES = 5; // Reconnect if no response for 5 cycles
+    private volatile long lastMessageReceivedTime = System.currentTimeMillis();
+    private Runnable pongCheckRunnable = null;
+
+    // Heartbeat: AlarmManager is the only timer that fires while the CPU sleeps (Handler timers
+    // use uptime). Each beat holds a partial wake lock long enough for PING/PONG or a reconnection
+    // (connect 10 s + handshake 15 s) and re-arms the next one.
+    private static final long HEARTBEAT_WIFI_MS = 2 * 60 * 1000;
+    private static final long HEARTBEAT_MOBILE_MS = 4 * 60 * 1000;
+    private static final long HEARTBEAT_DISCONNECTED_MS = 60 * 1000;
+    private static final long HEARTBEAT_LOW_BATTERY_FACTOR = 2;
+    private static final long HEARTBEAT_WAKELOCK_MS = 40 * 1000;
+    private static final int HEARTBEAT_REQUEST_CODE = 42;
+    // Keeps the Wi-Fi radio out of power-save while connected on Wi-Fi: otherwise incoming
+    // packets (notifications) can be delayed by several seconds with the screen off.
+    private static final boolean USE_WIFI_LOCK = true;
+    private AlarmManager alarmManager = null;
+    private PowerManager.WakeLock heartbeatLock = null;
+    private WifiManager.WifiLock wifiLock = null;
 
     // Device state monitoring (battery, network, screen, doze)
     private KaZaDeviceStateMonitor deviceMonitor = null;
@@ -311,14 +355,41 @@ public class NotificationService extends Service
         return instance != null ? "running" : "stopped";
     }
 
+    private int lastNotificationId = 0;
+
+    /** Stable, strictly increasing id (seconds since epoch): a restart of the service never overwrites a displayed notification. */
+    private synchronized int nextNotificationId() {
+        int id = (int) (System.currentTimeMillis() / 1000L);
+        if (id <= lastNotificationId) {
+            id = lastNotificationId + 1;
+        }
+        lastNotificationId = id;
+        return id;
+    }
+
+    private PendingIntent createOpenAppIntent(int requestCode) {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch == null) {
+            launch = new Intent();
+            launch.setClassName(getPackageName(), "org.kaza.KaZaActivity");
+        }
+        launch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        return PendingIntent.getActivity(this, requestCode, launch,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
     /**
-     * Send an Android notification with the given title and message
-     * Each notification gets a unique ID so multiple notifications can be displayed
+     * Send an Android notification with the given title and message.
+     * Each notification gets a unique id so multiple notifications can be displayed; tapping it opens the app.
      */
     public void notify(String title, String message) {
         try {
             NotificationManager m_notificationManager = (NotificationManager)
                     this.getSystemService(Context.NOTIFICATION_SERVICE);
+
+            if (!m_notificationManager.areNotificationsEnabled()) {
+                Log.w(TAG, "KaZaService: Notifications are disabled for KaZa - the alert cannot be displayed");
+            }
 
             // Create or get notification channel for Android 8.0+
             String channelId = "KaZaNotifications";
@@ -342,20 +413,24 @@ public class NotificationService extends Service
                 m_builder = new Notification.Builder(this, channelId);
             } else {
                 m_builder = new Notification.Builder(this);
+                m_builder.setDefaults(Notification.DEFAULT_ALL);
+                m_builder.setPriority(Notification.PRIORITY_HIGH);
             }
 
+            int notificationId = nextNotificationId();
             Bitmap icon = BitmapFactory.decodeResource(this.getResources(), R.drawable.icon);
-            m_builder.setSmallIcon(R.drawable.icon)
+            m_builder.setSmallIcon(R.drawable.ic_stat_kaza)          // monochrome status-bar icon
                     .setLargeIcon(icon)
                     .setContentTitle(title)
                     .setContentText(message)
-                    .setDefaults(Notification.DEFAULT_ALL) // Sound, vibration, lights
                     .setColor(Color.GREEN)
+                    .setCategory(Notification.CATEGORY_MESSAGE)
+                    .setWhen(System.currentTimeMillis())
+                    .setShowWhen(true)
                     .setAutoCancel(true)
+                    .setContentIntent(createOpenAppIntent(notificationId))
                     .setStyle(new Notification.BigTextStyle().bigText(message)); // Support long text
 
-            // Use unique notification ID so multiple notifications can be shown
-            int notificationId = notificationIdCounter++;
             m_notificationManager.notify(notificationId, m_builder.build());
 
             Log.i(TAG, "KaZaService: Notification displayed (ID: " + notificationId + ")");
@@ -372,33 +447,18 @@ public class NotificationService extends Service
 
         instance = this;
 
-        // Start as foreground service with persistent notification
-        // Required for Android 8.0+ to keep service alive
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ requires explicit service type
-            // Check if location permissions are granted before using LOCATION service type
-            boolean hasLocationPermission = false;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                boolean hasFineLocation = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED;
-                boolean hasCoarseLocation = checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED;
-                hasLocationPermission = hasFineLocation || hasCoarseLocation;
-                Log.i(TAG, "KaZaService: Location permissions - Fine: " + hasFineLocation + ", Coarse: " + hasCoarseLocation);
-            }
+        alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm != null) {
+            heartbeatLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KaZa:heartbeat");
+            heartbeatLock.setReferenceCounted(false);
+        }
 
-            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING;
-            if (hasLocationPermission) {
-                serviceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
-                Log.i(TAG, "KaZaService: Starting with REMOTE_MESSAGING + LOCATION service types");
-            } else {
-                Log.w(TAG, "KaZaService: Location permission not granted - starting with REMOTE_MESSAGING only");
-                Log.w(TAG, "KaZaService: GPS features will not be available until location permission is granted");
-            }
-
-            startForeground(NOTIFICATION_ID, createForegroundNotification(), serviceType);
-        } else {
-            startForeground(NOTIFICATION_ID, createForegroundNotification());
+        // Must be called within a few seconds of startForegroundService(); never throws
+        if (!startForegroundCompat()) {
+            Log.e(TAG, "KaZaService: Cannot enter foreground - stopping");
+            stopSelf();
+            return;
         }
 
         Log.i(TAG, "KaZaService: Service created successfully - running in foreground");
@@ -413,8 +473,9 @@ public class NotificationService extends Service
         tracker.setProtocolCallback(new KaZaTracker.ProtocolCallback() {
             @Override
             public void sendCommand(String command) throws Exception {
-                if (protocol != null) {
-                    protocol.sendCommand(command);
+                Conn c = conn;
+                if (c != null) {
+                    c.protocol.sendCommand(command);
                 }
             }
 
@@ -448,38 +509,25 @@ public class NotificationService extends Service
             }
 
             @Override
-            public void onNetworkAvailable() {
-                // Network is back, attempt to reconnect if disconnected
-                if (!isConnected && configured) {
-                    Log.i(TAG, "KaZaService: Network restored, attempting reconnection");
-                    // Reset reconnection attempts to allow immediate reconnection
-                    reconnectAttempts = 0;
-                    cancelScheduledReconnect();
-                    connectToServer();
-                }
+            public void onNetworkAvailable(final Network network) {
+                connectionHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleDefaultNetworkAvailable(network);
+                    }
+                });
             }
 
             @Override
-            public void onNetworkLost() {
-                // Network lost, disconnect if connected
-                if (isConnected) {
-                    Log.w(TAG, "KaZaService: Disconnecting due to network loss");
-                    disconnectFromServer();
-                }
+            public void onNetworkLost(Network network) {
+                // Informative only: a new default network (Wi-Fi -> 4G) normally follows, and a
+                // dead socket is detected by the PING/PONG deadline. Tearing the connection down
+                // here is what used to leave the service disconnected after a network switch.
+                Log.i(TAG, "KaZaService: Default network lost: " + network);
             }
 
             @Override
             public void onDozeStateChanged(boolean isInDozeMode) {
-                if (isInDozeMode) {
-                    // Unregister network callback during Doze to reduce wake-ups
-                    // Socket timeout will handle connection loss detection
-                    deviceMonitor.unregisterNetworkReceiver();
-                    Log.i(TAG, "KaZaService: Network monitoring suspended during Doze (socket timeout will handle disconnects)");
-                } else {
-                    // Re-register network callback when exiting Doze
-                    deviceMonitor.registerNetworkReceiver();
-                    Log.i(TAG, "KaZaService: Network monitoring resumed");
-                }
                 updateKeepAliveInterval();
             }
 
@@ -515,13 +563,51 @@ public class NotificationService extends Service
         }
     }
 
+    /**
+     * (Re)enter foreground with the service types matching the permissions currently granted.
+     * Location type needs a granted location permission, and is refused when the service is
+     * started from the background on Android 14+ (e.g. BOOT_COMPLETED): fall back to
+     * remote messaging only, the location type is restored by PERMISSIONS_CHANGED.
+     * @return false if the service could not enter foreground at all
+     */
+    private boolean startForegroundCompat() {
+        Notification notification = createForegroundNotification();
+        boolean hasLocation = PermissionActivity.hasLocationPermission(this);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING;
+            if (hasLocation) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
+            }
+            try {
+                startForeground(NOTIFICATION_ID, notification, type);
+                Log.i(TAG, "KaZaService: Foreground type " + type + " (location permission: " + hasLocation + ")");
+                return true;
+            } catch (Exception e) {
+                Log.w(TAG, "KaZaService: Foreground type " + type + " refused (" + e + "), falling back to remote messaging");
+            }
+            try {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "KaZaService: startForeground failed: " + e);
+                return false;
+            }
+        }
+
+        try {
+            startForeground(NOTIFICATION_ID, notification);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "KaZaService: startForeground failed: " + e);
+            return false;
+        }
+    }
+
     @Override
     public void onDestroy() {
         Log.i(TAG, "KaZaService: Destroying Notification Service");
         Log.i(TAG, "KaZaService: Service was running in PID: " + android.os.Process.myPid());
-
-        // Cancel any scheduled reconnections
-        cancelScheduledReconnect();
 
         // Stop device state monitoring
         if (deviceMonitor != null) {
@@ -537,19 +623,33 @@ public class NotificationService extends Service
             tracker.stopAutomaticPositionTracking();
         }
 
-        // Close SSL connection
-        disconnectFromServer();
+        positionExecutor.shutdownNow();
+
+        cancelHeartbeat();
+
+        // Close SSL connection and drop every pending timer
+        if (connectionHandler != null) {
+            connectionHandler.removeCallbacksAndMessages(null);
+        }
+        Conn c = conn;
+        if (c != null) {
+            closeConnection(c);
+        }
 
         // Stop connection thread
         if (connectionThread != null) {
             connectionThread.quitSafely();
             try {
-                connectionThread.join();
+                connectionThread.join(2000);
             } catch (InterruptedException e) {
                 Log.e(TAG, "KaZaService: Error stopping connection thread", e);
             }
         }
 
+        releaseWifiLock();
+        if (heartbeatLock != null && heartbeatLock.isHeld()) {
+            heartbeatLock.release();
+        }
         instance = null;
 
         super.onDestroy();
@@ -558,9 +658,8 @@ public class NotificationService extends Service
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "KaZaService: onStartCommand called");
-        Log.i(TAG, "KaZaService: Service running in PID: " + android.os.Process.myPid());
 
-        // Handle configuration via Intent extras (works across processes)
+        // Handle commands via Intent extras (works across processes)
         if (intent != null && intent.hasExtra("ACTION")) {
             String action = intent.getStringExtra("ACTION");
             Log.i(TAG, "KaZaService: Received action: " + action);
@@ -578,9 +677,14 @@ public class NotificationService extends Service
                 if (clientCert != null && caCert != null && clientKey != null &&
                     host != null && port > 0 && user != null) {
 
-                    Log.i(TAG, "KaZaService: Configuring service via Intent");
+                    boolean changed = !configured
+                        || !clientCert.equals(sslClientCert) || !caCert.equals(sslCaCert)
+                        || !clientKey.equals(sslClientKey)
+                        || !java.util.Objects.equals(clientPass, sslClientPass)
+                        || !host.equals(sslHost) || port != sslPort || !user.equals(username);
+
+                    Log.i(TAG, "KaZaService: Configuring service via Intent (changed: " + changed + ")");
                     Log.i(TAG, "KaZaService: Host: " + host + ":" + port);
-                    Log.i(TAG, "KaZaService: Username: " + user);
 
                     // Store configuration
                     this.sslClientCert = clientCert;
@@ -595,13 +699,33 @@ public class NotificationService extends Service
                     // Save to SharedPreferences for persistence
                     saveConfiguration();
 
-                    Log.i(TAG, "KaZaService: Configuration stored successfully");
-
-                    // Connect to server
-                    connectToServer();
+                    if (changed) {
+                        reconnectNow("configuration changed");
+                    } else {
+                        connectToServer();
+                    }
                 } else {
                     Log.w(TAG, "KaZaService: Invalid configuration in Intent - missing parameters");
                 }
+            } else if ("PERMISSIONS_CHANGED".equals(action)) {
+                // Permissions were granted: restore the location foreground type and the tracking
+                startForegroundCompat();
+                if (tracker != null) {
+                    if (deviceMonitor != null && deviceMonitor.isScreenOn()) {
+                        tracker.startLocationCaching();
+                    }
+                    connectionHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (isConnected) {
+                                tracker.startAutomaticPositionTracking();
+                            }
+                        }
+                    });
+                }
+                updateForegroundNotification();
+            } else if ("RECONNECT".equals(action)) {
+                reconnectNow("requested");
             }
         }
 
@@ -615,7 +739,6 @@ public class NotificationService extends Service
     }
 
     private Notification createForegroundNotification(boolean connected) {
-        Log.i(TAG, "KaZaService: create Foreground Notification (connected: " + connected + ")");
         NotificationManager notificationManager = (NotificationManager)
                 this.getSystemService(Context.NOTIFICATION_SERVICE);
         Notification.Builder builder;
@@ -634,27 +757,51 @@ public class NotificationService extends Service
 
         Bitmap icon = BitmapFactory.decodeResource(this.getResources(), R.drawable.icon);
 
-        // Determine status based on connection state and reconnection attempts
+        // Status text: connection state, reconnection progress, configuration error
         String statusText;
         int color;
 
         if (connected) {
             statusText = "KaZa service connected";
             color = Color.GREEN;
-        } else if (reconnectAttempts > 0 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-            statusText = "KaZa is disconnected (reconnecting...)";
+        } else if (configError && lastError != null) {
+            statusText = "KaZa configuration error: " + lastError;
+            color = Color.RED;
+        } else if (configured) {
+            statusText = reconnectAttempts > 0
+                ? "KaZa is disconnected (reconnecting, attempt " + reconnectAttempts + ")"
+                : "KaZa is connecting...";
             color = 0xFFFFA500; // Orange
         } else {
-            statusText = "KaZa is disconnected";
+            statusText = "KaZa is not configured";
             color = Color.RED;
         }
 
-        return builder.setSmallIcon(R.drawable.icon)
+        // Missing permission: the notification leads to the onboarding instead of the app
+        PendingIntent contentIntent;
+        if (!PermissionActivity.allGranted(this)) {
+            statusText += " - permissions missing, tap to fix";
+            Intent permissions = new Intent(this, PermissionActivity.class);
+            permissions.putExtra("force", true);
+            permissions.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            contentIntent = PendingIntent.getActivity(this, 1, permissions,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        } else {
+            contentIntent = createOpenAppIntent(1);
+        }
+
+        builder.setSmallIcon(R.drawable.ic_stat_kaza)
                 .setLargeIcon(icon)
                 .setContentTitle("KaZa")
                 .setContentText(statusText)
                 .setColor(color)
-                .build();
+                .setOngoing(true)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .setContentIntent(contentIntent);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
+        return builder.build();
     }
 
     /**
@@ -665,205 +812,348 @@ public class NotificationService extends Service
             NotificationManager notificationManager = (NotificationManager)
                     getSystemService(Context.NOTIFICATION_SERVICE);
             if (notificationManager != null) {
-                Notification notification = createForegroundNotification(isConnected);
-                notificationManager.notify(NOTIFICATION_ID, notification);
-                Log.d(TAG, "KaZaService: Foreground notification updated (connected: " + isConnected + ")");
+                notificationManager.notify(NOTIFICATION_ID, createForegroundNotification(isConnected));
             }
         } catch (Exception e) {
             Log.e(TAG, "KaZaService: Failed to update notification: " + e.getMessage());
         }
     }
 
+    /** Thrown for errors that retrying quickly cannot fix (missing/invalid certificate or key). */
+    private static class ConfigException extends Exception {
+        ConfigException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     /**
-     * Connect to SSL server in background thread
+     * Request a connection attempt (no-op when already connected or connecting).
+     * Safe from any thread.
      */
     private void connectToServer() {
         if (!configured) {
             Log.w(TAG, "KaZaService: Cannot connect - not configured");
             return;
         }
-
-        if (isConnected) {
-            Log.i(TAG, "KaZaService: Already connected to server");
+        if (connectionHandler == null) {
             return;
         }
-
-        Log.i(TAG, "KaZaService: Initiating connection to " + sslHost + ":" + sslPort);
-
-        // Run connection on background thread
         connectionHandler.post(new Runnable() {
             @Override
             public void run() {
-                try {
-                    Log.i(TAG, "KaZaService: Loading SSL certificates...");
-                    Log.i(TAG, "KaZaService: CA cert path: " + sslCaCert);
+                doConnect();
+            }
+        });
+    }
 
-                    // Load CA certificate
-                    CertificateFactory cf = CertificateFactory.getInstance("X.509");
-                    InputStream caInput = null;
-                    Certificate ca = null;
+    // ------------------------------------------------------------------ heartbeat / wake locks
 
-                    try {
-                        // Remove file:// prefix if present
-                        String caCertPath = sslCaCert;
-                        if (caCertPath.startsWith("file://")) {
-                            caCertPath = caCertPath.substring(7);
-                        }
+    /** Hold the CPU awake for at most timeoutMs (auto-released, so it can never leak). */
+    private void holdWakeLock(long timeoutMs) {
+        PowerManager.WakeLock lock = heartbeatLock;
+        if (lock != null) {
+            try {
+                lock.acquire(timeoutMs);
+            } catch (Exception e) {
+                Log.w(TAG, "KaZaService: Cannot acquire wake lock: " + e);
+            }
+        }
+    }
 
-                        Log.i(TAG, "KaZaService: Reading CA cert from: " + caCertPath);
-                        caInput = new FileInputStream(caCertPath);
-                        ca = cf.generateCertificate(caInput);
-                        Log.i(TAG, "KaZaService: ✓ CA certificate loaded: " + ((java.security.cert.X509Certificate) ca).getSubjectDN());
-                    } finally {
-                        if (caInput != null) {
-                            caInput.close();
-                        }
-                    }
+    private PendingIntent heartbeatIntent() {
+        Intent intent = new Intent(this, KaZaHeartbeatReceiver.class);
+        intent.setAction("org.kaza.HEARTBEAT");
+        return PendingIntent.getBroadcast(this, HEARTBEAT_REQUEST_CODE, intent,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+    }
 
-                    // Create a KeyStore containing our trusted CA certificate
-                    String keyStoreType = KeyStore.getDefaultType();
-                    KeyStore keyStore = KeyStore.getInstance(keyStoreType);
-                    keyStore.load(null, null);
-                    keyStore.setCertificateEntry("ca", ca);
-                    Log.i(TAG, "KaZaService: CA certificate added to KeyStore");
+    private long heartbeatInterval() {
+        if (!isConnected) {
+            return HEARTBEAT_DISCONNECTED_MS;
+        }
+        long interval = (deviceMonitor != null && deviceMonitor.isOnWifi()) ? HEARTBEAT_WIFI_MS : HEARTBEAT_MOBILE_MS;
+        if (deviceMonitor != null && deviceMonitor.isLowBattery()) {
+            interval *= HEARTBEAT_LOW_BATTERY_FACTOR;
+        }
+        return interval;
+    }
 
-                    // Create a TrustManager that trusts the CA certificate
-                    String tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
-                    TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
-                    tmf.init(keyStore);
-                    Log.i(TAG, "KaZaService: TrustManager created");
+    /**
+     * Arm (replace) the next heartbeat alarm. Exact when the user allows it, otherwise
+     * setAndAllowWhileIdle, which still fires in Doze (rate-limited unless the app is exempt
+     * from battery optimizations).
+     */
+    private void scheduleHeartbeat() {
+        if (alarmManager == null || !configured) {
+            return;
+        }
+        long triggerAt = SystemClock.elapsedRealtime() + heartbeatInterval();
+        PendingIntent pi = heartbeatIntent();
+        try {
+            boolean exact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms();
+            if (exact) {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            } else {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            }
+        } catch (SecurityException e) {
+            alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+        }
+    }
 
-                    // Load client certificate and key for mutual TLS
-                    Log.i(TAG, "KaZaService: Loading client certificate...");
-                    Log.i(TAG, "KaZaService: Client cert path: " + sslClientCert);
-                    Log.i(TAG, "KaZaService: Client key path: " + sslClientKey);
+    private void cancelHeartbeat() {
+        if (alarmManager != null) {
+            alarmManager.cancel(heartbeatIntent());
+        }
+    }
 
-                    // Load client certificate
-                    String clientCertPath = sslClientCert;
-                    if (clientCertPath.startsWith("file://")) {
-                        clientCertPath = clientCertPath.substring(7);
-                    }
-
-                    InputStream clientCertInput = new FileInputStream(clientCertPath);
-                    Certificate clientCert = cf.generateCertificate(clientCertInput);
-                    clientCertInput.close();
-                    Log.i(TAG, "KaZaService: Client certificate loaded: " +
-                        ((java.security.cert.X509Certificate) clientCert).getSubjectDN());
-
-                    // Load private key
-                    String clientKeyPath = sslClientKey;
-                    if (clientKeyPath.startsWith("file://")) {
-                        clientKeyPath = clientKeyPath.substring(7);
-                    }
-
-                    PrivateKey privateKey = loadPrivateKey(clientKeyPath, sslClientPass);
-                    Log.i(TAG, "KaZaService: Private key loaded");
-
-                    // Create KeyStore with client certificate and private key
-                    KeyStore clientKeyStore = KeyStore.getInstance(KeyStore.getDefaultType());
-                    clientKeyStore.load(null, null);
-                    clientKeyStore.setKeyEntry("client", privateKey,
-                        sslClientPass != null ? sslClientPass.toCharArray() : new char[0],
-                        new Certificate[]{clientCert});
-                    Log.i(TAG, "KaZaService: Client KeyStore created");
-
-                    // Create KeyManager with client certificate
-                    KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-                    kmf.init(clientKeyStore, sslClientPass != null ? sslClientPass.toCharArray() : new char[0]);
-                    Log.i(TAG, "KaZaService: KeyManager created");
-
-                    // Create SSL context with both KeyManager and TrustManager
-                    SSLContext sslContext = SSLContext.getInstance("TLS");
-                    sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
-                    Log.i(TAG, "KaZaService: SSL context created with client certificate");
-
-                    Log.i(TAG, "KaZaService: Connecting to " + sslHost + ":" + sslPort + "...");
-
-                    // Create SSL socket
-                    sslSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(sslHost, sslPort);
-
-                    // Set dynamic socket timeout based on device state for battery optimization
-                    // This prevents blocking forever on read operations
-                    int socketTimeout = getSocketTimeout();
-                    sslSocket.setSoTimeout(socketTimeout);
-                    Log.i(TAG, "KaZaService: Socket timeout set to " + (socketTimeout / 1000) + " seconds (adaptive)");
-
-                    sslSocket.startHandshake();
-
-                    // Enable TCP keep-alive for battery efficiency (kernel-level, no app wake-ups)
-                    sslSocket.setKeepAlive(true);
-                    sslSocket.setTcpNoDelay(true);
-                    Log.i(TAG, "KaZaService: TCP keep-alive enabled on socket");
-
-                    isConnected = true;
-
-                    // Reset reconnection attempts on successful connection
+    /**
+     * Alarm fired (called by KaZaHeartbeatReceiver, any thread): the CPU is awake only for the
+     * duration of the broadcast, so take our own wake lock first, then PING or reconnect.
+     */
+    void onHeartbeat() {
+        holdWakeLock(HEARTBEAT_WAKELOCK_MS);
+        Handler h = connectionHandler;
+        if (h == null) {
+            return;
+        }
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                scheduleHeartbeat();
+                if (!configured) {
+                    return;
+                }
+                Conn c = conn;
+                if (c != null && !c.closed) {
+                    Log.d(TAG, "KaZaService: Heartbeat - checking connection");
+                    sendKeepAlive();
+                } else if (state == State.DISCONNECTED) {
+                    Log.i(TAG, "KaZaService: Heartbeat - disconnected, reconnecting now");
                     reconnectAttempts = 0;
                     cancelScheduledReconnect();
-
-                    // Reset connection health monitoring timestamp
-                    lastMessageReceivedTime = System.currentTimeMillis();
-
-                    Log.i(TAG, "KaZaService: Connected successfully to " + sslHost + ":" + sslPort);
-                    Log.i(TAG, "KaZaService: SSL Session: " + sslSocket.getSession().getCipherSuite());
-                    Log.i(TAG, "KaZaService: Server certificate validated successfully");
-
-                    // Initialize KaZa protocol
-                    try {
-                        protocol = new KaZaProtocol(sslSocket.getInputStream(), sslSocket.getOutputStream());
-                        Log.i(TAG, "KaZaService: KaZa protocol initialized");
-
-                        // Get device name from Android system
-                        String deviceName = Build.MODEL; // e.g., "Pixel 5", "Galaxy S21"
-
-                        // Send VERSION as FIRST frame (protocol version negotiation)
-                        // Parameters: username (from config), device name (from Android), channel (0)
-                        protocol.sendVersion(username, deviceName, 0);
-                        Log.i(TAG, "KaZaService: VERSION frame sent - waiting for response");
-
-                        // Start reader thread for incoming messages
-                        // The reader will handle VERSION response and then we can send other commands
-                        startReaderThread();
-
-                        // Start keep-alive mechanism to detect dead connections
-                        startKeepAlive();
-
-                    } catch (Exception e) {
-                        Log.e(TAG, "KaZaService: ERROR: Failed to initialize protocol: " + e.getMessage());
-                        throw e;
-                    }
-
-                } catch (java.io.FileNotFoundException e) {
-                    isConnected = false;
-                    Log.e(TAG, "KaZaService: ERROR: CA certificate file not found: " + sslCaCert);
-                    Log.e(TAG, "KaZaService: Please check the certificate path");
-                    // Don't retry for file not found - it's a configuration error
-                    Log.e(TAG, "KaZaService: Stopping reconnection attempts - fix configuration first");
-                } catch (java.security.cert.CertificateException e) {
-                    isConnected = false;
-                    Log.e(TAG, "KaZaService: ERROR: Invalid certificate: " + e.getMessage());
-                    // Don't retry for certificate errors - it's a configuration error
-                    Log.e(TAG, "KaZaService: Stopping reconnection attempts - fix certificate first");
-                } catch (Exception e) {
-                    isConnected = false;
-                    String errorMsg = e.getMessage();
-                    Log.e(TAG, "KaZaService: ERROR: Connection failed: " + errorMsg, e);
-
-                    // Check if this is a permanent error (key format, etc.)
-                    if (errorMsg != null && (errorMsg.contains("PBES2") ||
-                                            errorMsg.contains("Unsupported encryption") ||
-                                            errorMsg.contains("decrypt PKCS#8"))) {
-                        Log.e(TAG, "KaZaService: Permanent key decryption error - stopping reconnection");
-                        Log.e(TAG, "KaZaService: Please convert your private key to a compatible format");
-                        // Reset reconnection attempts to avoid spamming logs
-                        reconnectAttempts = MAX_RECONNECT_ATTEMPTS;
-                    } else {
-                        // Only retry for transient errors (network, timeout, etc.)
-                        scheduleReconnect();
-                    }
+                    doConnect();
                 }
             }
         });
+    }
+
+    /** Hold a Wi-Fi lock while connected through Wi-Fi, release it otherwise. */
+    private void updateWifiLock() {
+        if (!USE_WIFI_LOCK) {
+            return;
+        }
+        boolean wanted = isConnected && deviceMonitor != null && deviceMonitor.isOnWifi();
+        if (!wanted) {
+            releaseWifiLock();
+            return;
+        }
+        try {
+            if (wifiLock == null) {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) {
+                    return;
+                }
+                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wm.createWifiLock(mode, "KaZa:wifi");
+                wifiLock.setReferenceCounted(false);
+            }
+            if (!wifiLock.isHeld()) {
+                wifiLock.acquire();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "KaZaService: Cannot acquire Wi-Fi lock: " + e);
+        }
+    }
+
+    private void releaseWifiLock() {
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) {
+                wifiLock.release();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "KaZaService: Cannot release Wi-Fi lock: " + e);
+        }
+    }
+
+    /** Drop the current connection (if any) and reconnect immediately with a fresh backoff. */
+    private void reconnectNow(final String reason) {
+        if (connectionHandler == null) {
+            return;
+        }
+        connectionHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                Log.i(TAG, "KaZaService: Reconnecting now (" + reason + ")");
+                Conn c = conn;
+                if (c != null) {
+                    closeConnection(c);
+                }
+                reconnectAttempts = 0;
+                cancelScheduledReconnect();
+                doConnect();
+            }
+        });
+    }
+
+    private void handleDefaultNetworkAvailable(Network network) {
+        holdWakeLock(HEARTBEAT_WAKELOCK_MS);
+        Conn c = conn;
+        if (c == null) {
+            if (configured && state == State.DISCONNECTED) {
+                Log.i(TAG, "KaZaService: Network available while disconnected, reconnecting");
+                reconnectAttempts = 0;
+                cancelScheduledReconnect();
+                doConnect();
+            }
+        } else if (c.network != null && network != null && !network.equals(c.network)) {
+            // The socket is bound to the previous network (Wi-Fi <-> mobile): it will never recover
+            Log.i(TAG, "KaZaService: Default network changed (" + c.network + " -> " + network + "), reconnecting");
+            reconnectNow("default network changed");
+        }
+    }
+
+    private Network currentNetwork() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            return cm != null ? cm.getActiveNetwork() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private SSLContext buildSslContext() throws Exception {
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+
+        // CA certificate
+        Certificate ca;
+        InputStream caInput = new FileInputStream(stripFileScheme(sslCaCert));
+        try {
+            ca = cf.generateCertificate(caInput);
+        } finally {
+            caInput.close();
+        }
+        KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        keyStore.load(null, null);
+        keyStore.setCertificateEntry("ca", ca);
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(keyStore);
+
+        // Client certificate and key (mutual TLS)
+        InputStream clientCertInput = new FileInputStream(stripFileScheme(sslClientCert));
+        Certificate clientCert;
+        try {
+            clientCert = cf.generateCertificate(clientCertInput);
+        } finally {
+            clientCertInput.close();
+        }
+        PrivateKey privateKey = loadPrivateKey(stripFileScheme(sslClientKey), sslClientPass);
+
+        char[] pass = sslClientPass != null ? sslClientPass.toCharArray() : new char[0];
+        KeyStore clientKeyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        clientKeyStore.load(null, null);
+        clientKeyStore.setKeyEntry("client", privateKey, pass, new Certificate[]{clientCert});
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(clientKeyStore, pass);
+
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+        return sslContext;
+    }
+
+    private static String stripFileScheme(String path) {
+        return path.startsWith("file://") ? path.substring(7) : path;
+    }
+
+    /**
+     * Open the connection. Runs on connectionHandler only.
+     * TLS connect and handshake are bounded; the established socket has no read timeout
+     * (liveness is the PING/PONG deadline), so a frame can never be read half-way.
+     */
+    private void doConnect() {
+        if (!configured || state != State.DISCONNECTED) {
+            return;
+        }
+        state = State.CONNECTING;
+        cancelScheduledReconnect();
+        holdWakeLock(HEARTBEAT_WAKELOCK_MS);
+        scheduleHeartbeat();
+        final int generation = ++connGeneration;
+        updateForegroundNotification();
+
+        Log.i(TAG, "KaZaService: Connecting to " + sslHost + ":" + sslPort + " (generation " + generation + ")");
+        SSLSocket socket = null;
+        try {
+            SSLContext sslContext;
+            try {
+                sslContext = buildSslContext();
+            } catch (java.io.FileNotFoundException e) {
+                throw new ConfigException("file not found: " + e.getMessage(), e);
+            } catch (java.security.cert.CertificateException e) {
+                throw new ConfigException("invalid certificate: " + e.getMessage(), e);
+            } catch (Exception e) {
+                String msg = e.getMessage();
+                if (msg != null && (msg.contains("PBES2") || msg.contains("Unsupported encryption")
+                        || msg.contains("decrypt PKCS#8") || msg.contains("Failed to parse")
+                        || msg.contains("requires a password"))) {
+                    throw new ConfigException("private key: " + msg, e);
+                }
+                throw e;
+            }
+
+            Network network = currentNetwork();
+            Socket raw = new Socket();
+            raw.connect(new InetSocketAddress(sslHost, sslPort), CONNECT_TIMEOUT_MS);
+            socket = (SSLSocket) sslContext.getSocketFactory().createSocket(raw, sslHost, sslPort, true);
+            socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+            socket.startHandshake();
+            socket.setSoTimeout(0);
+            socket.setKeepAlive(true);
+            socket.setTcpNoDelay(true);
+
+            KaZaProtocol protocol = new KaZaProtocol(socket.getInputStream(), socket.getOutputStream());
+            Conn c = new Conn(generation, socket, protocol, network);
+            conn = c;
+            isConnected = true;
+            state = State.CONNECTED;
+            lastError = null;
+            configError = false;
+            lastMessageReceivedTime = System.currentTimeMillis();
+            Log.i(TAG, "KaZaService: TLS established (" + socket.getSession().getCipherSuite() + ")");
+
+            // VERSION must be the first frame
+            protocol.sendVersion(username, Build.MODEL, 0);
+
+            startReaderThread(c);
+            startKeepAlive();
+            updateWifiLock();
+            scheduleHeartbeat();
+            updateForegroundNotification();
+        } catch (ConfigException e) {
+            Log.e(TAG, "KaZaService: Configuration error: " + e.getMessage());
+            failConnect(socket, e.getMessage(), true);
+        } catch (Exception e) {
+            Log.e(TAG, "KaZaService: Connection failed: " + e);
+            failConnect(socket, e.toString(), false);
+        }
+    }
+
+    private void failConnect(SSLSocket socket, String reason, boolean permanent) {
+        if (socket != null) {
+            try { socket.close(); } catch (Exception ignored) { }
+        }
+        Conn c = conn;
+        if (c != null) {
+            c.closed = true;
+            conn = null;
+        }
+        isConnected = false;
+        state = State.DISCONNECTED;
+        lastError = reason;
+        configError = permanent;
+        scheduleReconnect();
     }
 
     /**
@@ -1304,295 +1594,262 @@ public class NotificationService extends Service
     }
 
     /**
-     * Start background thread to read incoming protocol frames
+     * Start the reader thread of a connection. The read blocks without timeout: the thread ends
+     * when the socket is closed (closeConnection) or fails, and only reports to the connection
+     * thread if its connection is still the current one.
      */
-    private void startReaderThread() {
-        if (readerThread != null) {
-            stopReaderThread();
-        }
-
-        readerThread = new HandlerThread("KaZaReaderThread");
-        readerThread.start();
-        readerHandler = new Handler(readerThread.getLooper());
-
-        Log.i(TAG, "KaZaService: Starting protocol reader thread");
-
-        readerHandler.post(new Runnable() {
+    private void startReaderThread(final Conn c) {
+        Thread reader = new Thread(new Runnable() {
             @Override
             public void run() {
-                Log.i(TAG, "KaZaService: Reader thread started, waiting for frames...");
+                String reason = "Connection closed";
                 try {
-                    while (isConnected && sslSocket != null && !sslSocket.isClosed()) {
-                        try {
-                            // Read a frame (BLOCKING call - waits for data)
-                            KaZaProtocol.ReceivedFrame frame = protocol.readFrame();
-
-                            // Process received frame
-                            handleReceivedFrame(frame);
-
-                        } catch (java.net.SocketTimeoutException e) {
-                            // Socket timeout (30s) - no data received, this is normal
-                            // Just continue and wait for more data
-                            Log.d(TAG, "KaZaService: Read timeout (no data for 30s), continuing...");
-                            continue;
-                        } catch (java.io.EOFException e) {
-                            Log.w(TAG, "KaZaService: Connection closed by server (EOF)");
-                            handleConnectionError("Connection closed by server");
-                            break;
-                        } catch (java.io.IOException e) {
-                            Log.e(TAG, "KaZaService: Read error: " + e.getMessage());
-                            handleConnectionError("Socket read error: " + e.getMessage());
-                            break;
-                        }
+                    while (!c.closed) {
+                        KaZaProtocol.ReceivedFrame frame = c.protocol.readFrame();
+                        dispatchFrame(c, frame);
                     }
-                    Log.i(TAG, "KaZaService: Reader thread exiting");
-                } catch (Exception e) {
-                    Log.e(TAG, "KaZaService: Reader thread error: " + e.getMessage(), e);
-                    handleConnectionError("Reader thread error: " + e.getMessage());
+                    return;
+                } catch (java.io.EOFException e) {
+                    reason = "Connection closed by server";
+                } catch (IOException e) {
+                    reason = "Socket read error: " + e.getMessage();
+                } catch (RuntimeException e) {
+                    reason = "Reader error: " + e;
+                }
+                if (!c.closed) {
+                    postConnectionLost(c, reason);
+                }
+            }
+        }, "KaZaReader-" + c.generation);
+        reader.setDaemon(true);
+        reader.start();
+    }
+
+    private void postConnectionLost(final Conn c, final String reason) {
+        Handler h = connectionHandler;
+        if (h == null) {
+            return;
+        }
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                onConnectionLost(c, reason);
+            }
+        });
+    }
+
+    /** Reader thread: record liveness, then hand the frame over without ever blocking the reader. */
+    private void dispatchFrame(final Conn c, KaZaProtocol.ReceivedFrame frame) {
+        lastMessageReceivedTime = System.currentTimeMillis();
+        if (!frame.isCommand()) {
+            return; // FILE / OBJVALUE / ... are not used by the service
+        }
+        final String command = frame.getPayloadAsString();
+        if (command.equals("PING") || command.equals("PONG")) {
+            return;
+        }
+        Log.i(TAG, "KaZaService: Received command: \"" + command + "\"");
+
+        if (command.equals("POSITION?")) {
+            // A position fix can take tens of seconds: neither the reader nor the connection thread may wait for it
+            positionExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    handlePositionRequest(c);
+                }
+            });
+            return;
+        }
+
+        Handler h = connectionHandler;
+        if (h == null) {
+            return;
+        }
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                if (c.generation == connGeneration && !c.closed) {
+                    handleCommand(c, command);
                 }
             }
         });
     }
 
-    /**
-     * Stop the reader thread
-     */
-    private void stopReaderThread() {
-        if (readerThread != null) {
-            Log.i(TAG, "KaZaService: Stopping reader thread");
-            readerThread.quitSafely();
-            try {
-                readerThread.join(1000); // Wait up to 1 second
-            } catch (InterruptedException e) {
-                Log.w(TAG, "KaZaService: Interrupted while waiting for reader thread");
-            }
-            readerThread = null;
-            readerHandler = null;
-        }
-    }
-
-    /**
-     * Handle received protocol frame
-     */
-    private void handleReceivedFrame(KaZaProtocol.ReceivedFrame frame) {
-        String position;
-        // Update last message received time (for connection health monitoring)
-        lastMessageReceivedTime = System.currentTimeMillis();
-
-        // Skip logging for PING/PONG frames to reduce battery drain
-        boolean isPingPong = (frame.isCommand() &&
-                             (frame.getPayloadAsString().equals("PING") ||
-                              frame.getPayloadAsString().equals("PONG")));
-        if (!isPingPong) {
-            Log.i(TAG, "KaZaService: Processing frame - Type: " + frame.frameType + ", Size: " + frame.payload.length);
+    /** Connection thread */
+    private void handleCommand(Conn c, String command) {
+        if (deviceMonitor != null) {
+            deviceMonitor.resetIdleTimer();
         }
 
-        if (frame.isCommand()) {
-            String command = frame.getPayloadAsString();
+        if (command.startsWith("NOTIFY:")) {
+            String notificationText = command.substring(7);
+            notify("KaZa Alert", notificationText);
+            return;
+        }
 
-            // Skip logging for PING/PONG to reduce battery drain
-            if (!command.equals("PING") && !command.equals("PONG")) {
-                Log.i(TAG, "KaZaService: Received command: \"" + command + "\"");
-                // Update activity time for meaningful commands (not keep-alive)
-                if (deviceMonitor != null) {
-                    deviceMonitor.resetIdleTimer();
-                }
+        if (command.startsWith("ERROR:")) {
+            String errorMsg = command.substring(6).trim();
+            Log.e(TAG, "KaZaService: Server error: " + errorMsg);
+            if (errorMsg.contains("version")) {
+                lastError = "protocol version: " + errorMsg;
+                onConnectionLost(c, "Protocol version incompatible: " + errorMsg);
             }
+            return;
+        }
 
-            // Check for NOTIFY: command
-            if (command.startsWith("NOTIFY:")) {
-                String notificationText = command.substring(7); // Remove "NOTIFY:" prefix
-                Log.i(TAG, "KaZaService: Showing notification: " + notificationText);
-
-                // Send Android notification
-                notify("KaZa Alert", notificationText);
-                Log.i(TAG, "KaZaService: Notification sent successfully");
-                return;
-            }
-
-            // Handle version negotiation errors
-            if (command.startsWith("ERROR:")) {
-                String errorMsg = command.substring(6).trim(); // Remove "ERROR:" prefix
-                Log.e(TAG, "KaZaService: Server error: " + errorMsg);
-
-                // Check if it's a version incompatibility error
-                if (errorMsg.contains("Protocol version incompatible") ||
-                    errorMsg.contains("version")) {
-                    Log.e(TAG, "KaZaService: Version negotiation FAILED - disconnecting");
-                    handleConnectionError("Protocol version incompatible: " + errorMsg);
-                }
-                return;
-            }
-
-            // Handle other commands
-            switch (command) {
-                case "CONNECTED":
-                    Log.i(TAG, "KaZaService: ✓ Version negotiation successful - connection established");
-                    // Protocol is now ready - connection fully established
-
-                    // Start automatic position tracking (battery-efficient)
+        switch (command) {
+            case "CONNECTED":
+                Log.i(TAG, "KaZaService: Version negotiation successful - connection established");
+                reconnectAttempts = 0;
+                updateForegroundNotification();
+                if (tracker != null) {
                     tracker.startAutomaticPositionTracking();
-                    break;
+                }
+                break;
 
-                case "DISCONNECT":
-                    Log.i(TAG, "KaZaService: Server requested disconnect");
-                    disconnectFromServer();
-                    break;
+            case "DISCONNECT":
+                onConnectionLost(c, "Server requested disconnect");
+                break;
 
-                case "POSITION?":
-                    Log.i(TAG, "KaZaService: Position request received");
+            default:
+                Log.d(TAG, "KaZaService: Ignored command: " + command);
+                break;
+        }
+    }
 
-                    // Adaptive burst mode logic
-                    long now = System.currentTimeMillis();
-                    boolean wasInBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
-                    tracker.updateLastPositionRequestTime();
+    /** Position executor thread */
+    private void handlePositionRequest(Conn c) {
+        Log.i(TAG, "KaZaService: Position request received");
 
-                    if (!wasInBurstMode) {
-                        // Starting new burst mode
-                        burstModeStartTime = now;
-                        burstModeEndTime = now + BURST_MODE_DURATION_MS;
-                        Log.i(TAG, "KaZaService: Entering BURST MODE for 2 minutes (position tracking active)");
-                    } else {
-                        // Already in burst mode - check if we should extend
-                        long timeSinceStart = now - burstModeStartTime;
-                        long timeRemaining = burstModeEndTime - now;
+        // Adaptive burst mode logic
+        long now = System.currentTimeMillis();
+        boolean wasInBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
+        tracker.updateLastPositionRequestTime();
 
-                        if (timeSinceStart < BURST_MODE_MAX_DURATION_MS && timeRemaining < 60000) {
-                            // Less than 1 minute remaining and not at max duration - extend
-                            long newEndTime = now + BURST_MODE_EXTENSION_MS;
-                            if (newEndTime - burstModeStartTime <= BURST_MODE_MAX_DURATION_MS) {
-                                burstModeEndTime = newEndTime;
-                                long totalDuration = (burstModeEndTime - burstModeStartTime) / 1000;
-                                Log.i(TAG, "KaZaService: Burst mode extended (total duration: " + totalDuration + "s)");
-                            } else {
-                                Log.i(TAG, "KaZaService: Burst mode at max duration (5min) - not extending");
-                            }
-                        } else {
-                            Log.d(TAG, "KaZaService: Continuing burst mode (" + (timeRemaining / 1000) + "s remaining)");
-                        }
-                    }
-
-                    position = tracker.getGPSPosition(burstModeEndTime, deviceMonitor.isScreenOn());
-                    try {
-                        protocol.sendCommand("POSITION:" + position);
-                        Log.i(TAG, "KaZaService: Sent position: " + position);
-                    } catch (Exception e) {
-                        Log.e(TAG, "KaZaService: Failed to send position: " + e.getMessage());
-                    }
-                    break;
-
-                default:
-                    Log.i(TAG, "KaZaService: Unknown command: " + command);
-                    break;
-            }
-        } else if (frame.isFile()) {
-            Log.i(TAG, "KaZaService: Received file frame (" + frame.payload.length + " bytes)");
-            // TODO: Handle file frames
+        if (!wasInBurstMode) {
+            burstModeStartTime = now;
+            burstModeEndTime = now + BURST_MODE_DURATION_MS;
+            Log.i(TAG, "KaZaService: Entering BURST MODE for 2 minutes (position tracking active)");
         } else {
-            Log.i(TAG, "KaZaService: Received frame type: " + frame.frameType);
-            // TODO: Handle other frame types
+            long timeSinceStart = now - burstModeStartTime;
+            long timeRemaining = burstModeEndTime - now;
+            if (timeSinceStart < BURST_MODE_MAX_DURATION_MS && timeRemaining < 60000) {
+                long newEndTime = now + BURST_MODE_EXTENSION_MS;
+                if (newEndTime - burstModeStartTime <= BURST_MODE_MAX_DURATION_MS) {
+                    burstModeEndTime = newEndTime;
+                    Log.i(TAG, "KaZaService: Burst mode extended (total duration: "
+                          + ((burstModeEndTime - burstModeStartTime) / 1000) + "s)");
+                }
+            }
+        }
+
+        String position = tracker.getGPSPosition(burstModeEndTime, deviceMonitor.isScreenOn());
+        if (c.closed) {
+            return; // connection replaced while waiting for the fix
+        }
+        try {
+            c.protocol.sendCommand("POSITION:" + position);
+            Log.i(TAG, "KaZaService: Sent position: " + position);
+        } catch (Exception e) {
+            Log.e(TAG, "KaZaService: Failed to send position: " + e.getMessage());
+            postConnectionLost(c, "Failed to send position");
         }
     }
 
-
-
     /**
-     * Disconnect from SSL server
+     * Close a connection and release everything attached to it. Idempotent; the closing of the
+     * socket unblocks the reader thread. Runs on connectionHandler (or in onDestroy).
      */
+    private void closeConnection(Conn c) {
+        if (c == null) {
+            return;
+        }
+        boolean wasCurrent = (c == conn);
+        c.closed = true;
+        if (wasCurrent) {
+            if (tracker != null) {
+                tracker.stopAutomaticPositionTracking();
+            }
+            stopKeepAlive();
+            conn = null;
+            isConnected = false;
+            state = State.DISCONNECTED;
+            releaseWifiLock();
+        }
+        try {
+            c.socket.close();
+        } catch (Exception e) {
+            Log.w(TAG, "KaZaService: Error closing socket: " + e.getMessage());
+        }
+        if (wasCurrent) {
+            updateForegroundNotification();
+        }
+    }
+
+    /** Connection thread: the connection died; ignored if it is not the current one. */
+    private void onConnectionLost(Conn c, String reason) {
+        if (c != conn || c.closed) {
+            return;
+        }
+        Log.w(TAG, "KaZaService: Connection lost (generation " + c.generation + "): " + reason);
+        lastError = reason;
+        configError = false;
+        closeConnection(c);
+        scheduleReconnect();
+    }
+
+    /** User requested disconnection ("disconnect" query): no automatic reconnection. */
     private void disconnectFromServer() {
-        Log.i(TAG, "KaZaService: Disconnecting from server");
-
-        // Stop automatic position tracking
-        if (tracker != null) {
-            tracker.stopAutomaticPositionTracking();
+        Handler h = connectionHandler;
+        if (h == null) {
+            return;
         }
-
-        // Stop keep-alive
-        stopKeepAlive();
-
-        // Stop reader thread first
-        stopReaderThread();
-
-        // Close protocol and reset negotiation state
-        if (protocol != null) {
-            try {
-                protocol.close();
-                Log.i(TAG, "KaZaService: Protocol closed");
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Error closing protocol", e);
+        h.post(new Runnable() {
+            @Override
+            public void run() {
+                cancelScheduledReconnect();
+                closeConnection(conn);
             }
-            protocol = null;
-        }
-
-        // Close socket
-        if (sslSocket != null) {
-            try {
-                sslSocket.close();
-                Log.i(TAG, "KaZaService: Socket closed");
-            } catch (Exception e) {
-                Log.e(TAG, "KaZaService: Error closing socket", e);
-            }
-            sslSocket = null;
-        }
-
-        isConnected = false;
-        Log.i(TAG, "KaZaService: Disconnected");
-
-        // Update notification to show disconnected status
-        updateForegroundNotification();
+        });
     }
 
     /**
-     * Schedule reconnection with exponential backoff
+     * Schedule a reconnection with exponential backoff (2 s ... 60 s, +/- 20 % jitter).
+     * It never gives up; a configuration error is retried every few minutes (the files may appear).
      */
     private void scheduleReconnect() {
-        if (!configured) {
-            Log.w(TAG, "KaZaService: Not configured, cannot reconnect");
+        if (!configured || connectionHandler == null) {
             return;
         }
 
-        // Cancel any pending reconnect
         cancelScheduledReconnect();
-
         reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-            Log.e(TAG, "KaZaService: Max reconnection attempts reached, giving up");
-            // Update notification to show final disconnected state
-            updateForegroundNotification();
-            return;
+
+        int delay;
+        if (configError) {
+            delay = CONFIG_ERROR_RETRY_MS;
+        } else {
+            delay = Math.min(RECONNECT_BASE_DELAY_MS * (1 << Math.min(reconnectAttempts - 1, 5)), RECONNECT_MAX_DELAY_MS);
+            delay = (int) (delay * (0.8 + Math.random() * 0.4));
         }
+        Log.i(TAG, "KaZaService: Reconnection attempt " + reconnectAttempts + " in " + (delay / 1000) + " s");
 
-        // Calculate delay with exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s (max)
-        int delay = Math.min(
-            RECONNECT_BASE_DELAY_MS * (1 << (reconnectAttempts - 1)),
-            RECONNECT_MAX_DELAY_MS
-        );
-
-        Log.i(TAG, "KaZaService: Scheduling reconnection attempt " + reconnectAttempts +
-                   " in " + (delay / 1000) + " seconds");
-
-        // Update notification to show reconnecting state
         updateForegroundNotification();
 
         reconnectRunnable = new Runnable() {
             @Override
             public void run() {
-                Log.i(TAG, "KaZaService: Reconnection attempt " + reconnectAttempts);
-                connectToServer();
+                reconnectRunnable = null;
+                doConnect();
             }
         };
-
         connectionHandler.postDelayed(reconnectRunnable, delay);
     }
 
-    /**
-     * Cancel scheduled reconnection
-     */
     private void cancelScheduledReconnect() {
         if (reconnectRunnable != null && connectionHandler != null) {
             connectionHandler.removeCallbacks(reconnectRunnable);
             reconnectRunnable = null;
-            Log.d(TAG, "KaZaService: Cancelled scheduled reconnection");
         }
     }
 
@@ -1607,11 +1864,9 @@ public class NotificationService extends Service
 
         stopKeepAlive(); // Stop any existing keep-alive
 
-        // Calculate optimal interval based on current conditions
         updateKeepAliveInterval();
-
-        String intervalMode = getKeepAliveMode();
-        Log.i(TAG, "KaZaService: Starting adaptive keep-alive - " + intervalMode + " (" + (currentKeepAliveInterval / 1000) + "s)");
+        Log.i(TAG, "KaZaService: Starting adaptive keep-alive - " + getKeepAliveMode()
+              + " (" + (currentKeepAliveInterval / 1000) + "s)");
 
         keepAliveRunnable = new Runnable() {
             @Override
@@ -1621,8 +1876,7 @@ public class NotificationService extends Service
                 // Recalculate interval before scheduling next ping (adaptive)
                 updateKeepAliveInterval();
 
-                // Schedule next keep-alive with updated interval
-                if (isConnected && keepAliveHandler != null) {
+                if (isConnected && keepAliveHandler != null && keepAliveRunnable == this) {
                     keepAliveHandler.postDelayed(this, currentKeepAliveInterval);
                 }
             }
@@ -1631,62 +1885,61 @@ public class NotificationService extends Service
         keepAliveHandler.postDelayed(keepAliveRunnable, currentKeepAliveInterval);
     }
 
-    /**
-     * Stop keep-alive mechanism
-     */
     private void stopKeepAlive() {
-        if (keepAliveRunnable != null && keepAliveHandler != null) {
-            keepAliveHandler.removeCallbacks(keepAliveRunnable);
-            keepAliveRunnable = null;
-            Log.d(TAG, "KaZaService: Keep-alive stopped");
+        if (keepAliveHandler != null) {
+            if (keepAliveRunnable != null) {
+                keepAliveHandler.removeCallbacks(keepAliveRunnable);
+                keepAliveRunnable = null;
+            }
+            if (pongCheckRunnable != null) {
+                keepAliveHandler.removeCallbacks(pongCheckRunnable);
+                pongCheckRunnable = null;
+            }
         }
     }
 
     /**
-     * Send keep-alive ping
+     * Send PING and arm the PONG deadline: any frame received after the PING proves the link
+     * is alive, otherwise the connection is declared dead and re-established.
      */
     private void sendKeepAlive() {
-        if (!isConnected || protocol == null ) {
-            // Silently skip if not connected (avoid log spam)
+        final Conn c = conn;
+        if (c == null || c.closed) {
             return;
         }
 
-        // Connection health timeout monitoring
-        long now = System.currentTimeMillis();
-        long timeSinceLastMessage = now - lastMessageReceivedTime;
-        long maxTimeout = MAX_NO_RESPONSE_CYCLES * currentKeepAliveInterval;
-
-        if (timeSinceLastMessage > maxTimeout) {
-            Log.w(TAG, "KaZaService: Connection timeout - no response for " +
-                  (timeSinceLastMessage / 1000) + "s (max: " + (maxTimeout / 1000) + "s)");
-            handleConnectionError("Connection health timeout");
-            return;
-        }
-
+        final long sentAt = System.currentTimeMillis();
         try {
-            // Send PING without logging (battery optimization)
-            protocol.sendCommand("PING");
+            c.protocol.sendCommand("PING");
         } catch (Exception e) {
             Log.e(TAG, "KaZaService: Keep-alive failed: " + e.getMessage());
-            // Connection is dead, trigger reconnection
-            handleConnectionError("Keep-alive failed");
-        }
-    }
-
-    /**
-     * Handle connection error and trigger reconnection
-     */
-    private void handleConnectionError(String reason) {
-        Log.e(TAG, "KaZaService: Connection error: " + reason);
-
-        if (!isConnected) {
-            // Already disconnected, nothing to do
+            onConnectionLost(c, "Keep-alive failed");
             return;
         }
 
-        // Disconnect and schedule reconnection
-        disconnectFromServer();
-        scheduleReconnect();
+        if (pongCheckRunnable != null) {
+            keepAliveHandler.removeCallbacks(pongCheckRunnable);
+        }
+        pongCheckRunnable = new Runnable() {
+            private boolean graceGiven = false;
+
+            @Override
+            public void run() {
+                if (c != conn || c.closed || lastMessageReceivedTime >= sentAt) {
+                    return;
+                }
+                long lateness = System.currentTimeMillis() - (sentAt + PONG_TIMEOUT_MS);
+                if (!graceGiven && lateness > PONG_LATE_GRACE_MS) {
+                    // The timer fired long after its due time (device was asleep): the reader
+                    // thread has had no chance to deliver the PONG yet, wait one more period.
+                    graceGiven = true;
+                    keepAliveHandler.postDelayed(this, PONG_TIMEOUT_MS);
+                    return;
+                }
+                onConnectionLost(c, "No answer to PING within " + (PONG_TIMEOUT_MS / 1000) + " s");
+            }
+        };
+        keepAliveHandler.postDelayed(pongCheckRunnable, PONG_TIMEOUT_MS);
     }
 
     /**
@@ -1807,27 +2060,6 @@ public class NotificationService extends Service
         } else {
             return "Unknown network";
         }
-    }
-
-    /**
-     * Calculate dynamic socket timeout based on device state for battery optimization
-     * @return Socket timeout in milliseconds
-     */
-    private int getSocketTimeout() {
-        // Doze mode: longest timeout to minimize wake-ups
-        if (deviceMonitor.isInDozeMode()) {
-            return SOCKET_TIMEOUT_DOZE_MS;
-        }
-
-        // Active states (screen on or burst mode): short timeout for responsiveness
-        long now = System.currentTimeMillis();
-        boolean inBurstMode = (burstModeEndTime > 0 && now < burstModeEndTime);
-        if (deviceMonitor.isScreenOn() || inBurstMode) {
-            return SOCKET_TIMEOUT_ACTIVE_MS;
-        }
-
-        // Screen off: longer timeout for battery save
-        return SOCKET_TIMEOUT_SCREEN_OFF_MS;
     }
 
     /**

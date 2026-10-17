@@ -6,6 +6,7 @@
 #include <QSettings>
 #include <QSslError>
 #include <QSslSocket>
+#include <QTimer>
 #include "kazaprotocol.h"
 
 class QSslSocket;
@@ -49,6 +50,12 @@ class KazaApplicationManager : public QObject
     bool m_appStarted {false};
     bool m_started {false};
 
+    QTimer m_pingTimer;
+    QTimer m_reconnectTimer;
+    bool m_pongPending {false};
+    int m_reconnectAttempts {0};
+    Qt::ApplicationState m_appState {Qt::ApplicationActive};
+
     static KazaApplicationManager *m_instance;
 
 public:
@@ -83,6 +90,7 @@ private slots:
     void _startApplication();
     void _disconnected();
     void _sendObject(QVariant value, bool confirm);
+    void _pingTimeout();
 
 signals:
     void configuredChanged();
@@ -103,6 +111,7 @@ private:
     bool _configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
     void __appStateChange(Qt::ApplicationState state);
     void _calculateAppChecksum();
+    void _scheduleReconnect();
 
     void _processFrameSystem(const QString &command);
     void _processFrameFile(const QString &fileid, QByteArray data);
