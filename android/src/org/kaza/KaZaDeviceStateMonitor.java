@@ -55,8 +55,10 @@ public class KaZaDeviceStateMonitor {
     public interface StateChangeCallback {
         void onScreenStateChanged(boolean isScreenOn);
         void onBatteryStateChanged(int level, boolean isCharging, boolean isLowBattery);
-        void onNetworkAvailable();
-        void onNetworkLost();
+        /** A (new) default network is available; may differ from the one used by the socket */
+        void onNetworkAvailable(Network network);
+        /** The default network is gone (a new default may follow): informative only */
+        void onNetworkLost(Network network);
         void onDozeStateChanged(boolean isInDozeMode);
         Context getContext();
     }
@@ -195,7 +197,7 @@ public class KaZaDeviceStateMonitor {
                     public void onAvailable(Network network) {
                         Log.i(TAG, "KaZaDeviceStateMonitor: Network available - " + network);
                         if (callback != null) {
-                            callback.onNetworkAvailable();
+                            callback.onNetworkAvailable(network);
                         }
                     }
 
@@ -203,7 +205,7 @@ public class KaZaDeviceStateMonitor {
                     public void onLost(Network network) {
                         Log.w(TAG, "KaZaDeviceStateMonitor: Network lost - " + network);
                         if (callback != null) {
-                            callback.onNetworkLost();
+                            callback.onNetworkLost(network);
                         }
                     }
 
@@ -215,12 +217,9 @@ public class KaZaDeviceStateMonitor {
                     }
                 };
 
-                // Register callback for any network
-                NetworkRequest request = new NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build();
-
-                connectivityManager.registerNetworkCallback(request, networkCallback);
+                // Follow the *default* network only: onLost() of a secondary network (e.g. mobile data
+                // while Wi-Fi is the default) must never tear down the connection.
+                connectivityManager.registerDefaultNetworkCallback(networkCallback);
                 Log.i(TAG, "KaZaDeviceStateMonitor: Network connectivity monitoring registered");
 
             } catch (Exception e) {
