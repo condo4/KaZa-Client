@@ -84,7 +84,10 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
     m_debug = true;
 
     if(!m_configured)
+    {
         qInfo() << "Kaza need to configure";
+        _setStatus("Not configured");
+    }
 
 
     QDir rep(QStandardPaths::standardLocations(QStandardPaths::AppDataLocation).at(0));
@@ -123,6 +126,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
     socket.setSslConfiguration(sslConf);
 
     qDebug() << "Connecting to control port with SSL...";
+    _setStatus("Connecting to control server");
     socket.connectToHostEncrypted(host, port);
     if(!socket.waitForEncrypted(10000)) // Wait up to 10 seconds for SSL handshake
     {
@@ -132,6 +136,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
     }
 
     qDebug() << "SSL connection established to control port";
+    _setStatus("Retrieving configuration");
 
     // Send new protocol command: clientconf? adminpass username userpass
     QString command = QString("clientconf? %1 %2 %3\n")
@@ -228,6 +233,7 @@ bool KazaApplicationManager::setConfiguration(QString host,
         return false;
 
     qInfo().noquote() << "Kaza try connection to #" + host + "#:" + QString::number(port);
+    _setStatus("Connection in progress");
     m_ssl.connectToHostEncrypted(sslhost, sslport.toInt());
     qDebug() << "Try connection valid on" << sslhost << sslport.toInt();
 
@@ -273,6 +279,7 @@ void KazaApplicationManager::resume()
     if(!m_ssl.isEncrypted())
     {
         qDebug() << "KazaApplicationManager: Not connected - reconnecting to" << m_host << ":" << m_port;
+        _setStatus("Connection in progress");
 
         // Connect asynchronously - don't block UI thread
         m_ssl.connectToHostEncrypted(m_host, m_port);
@@ -305,6 +312,8 @@ void KazaApplicationManager::_encrypted()
     emit securedChanged();
     emit connectedChanged(m_ssl.isEncrypted());
 
+    _setStatus("Authentication");
+
     // Send version as FIRST frame after SSL handshake
     m_protocol.sendVersion(m_settings.value("username").toString(), m_devicename, 1);
 }
@@ -312,6 +321,7 @@ void KazaApplicationManager::_encrypted()
 void KazaApplicationManager::_startApplication()
 {
     qDebug() << "_startApplication";
+    _setStatus("Starting application");
     if(m_appWanted != m_appChecksum)
     {
         qWarning() << "Bad application recived";
@@ -334,6 +344,7 @@ void KazaApplicationManager::_disconnected() {
     if(m_secured) { m_secured = false; emit securedChanged(); }
     if(m_ready)   { m_ready = false; emit readyChanged(); }
     emit connectedChanged(false);
+    _setStatus("Disconnected");
 
     if(m_appState != Qt::ApplicationSuspended)
         _scheduleReconnect();
@@ -344,6 +355,7 @@ void KazaApplicationManager::_scheduleReconnect()
     m_reconnectAttempts++;
     int delay = qMin(60000, 2000 * (1 << qMin(m_reconnectAttempts - 1, 5)));
     qInfo() << "KazaApplicationManager: Reconnecting in" << delay << "ms (attempt" << m_reconnectAttempts << ")";
+    _setStatus(QString("Reconnecting in %1 s (attempt %2)").arg(delay / 1000).arg(m_reconnectAttempts));
     m_reconnectTimer.start(delay);
 }
 
@@ -548,6 +560,7 @@ void KazaApplicationManager::connectClient()
     _configureSslSocket(m_ssl, clientCert, caCert, clientKey, clientPassword, m_host, m_port);
 
     qInfo().noquote() << "Kaza try connection to #" + m_host + "#:" + QString::number(m_port);
+    _setStatus("Connection in progress");
     m_ssl.connectToHostEncrypted(m_host, m_port);
 }
 
@@ -655,6 +668,19 @@ QString KazaApplicationManager::errorMsg() const
     return m_errorMsg;
 }
 
+QString KazaApplicationManager::status() const
+{
+    return m_status;
+}
+
+void KazaApplicationManager::_setStatus(const QString &newStatus)
+{
+    if (m_status == newStatus)
+        return;
+    m_status = newStatus;
+    emit statusChanged();
+}
+
 void KazaApplicationManager::setErrorMsg(const QString &newErrorMsg)
 {
     if (m_errorMsg == newErrorMsg)
@@ -683,6 +709,7 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
             if(c[1] != m_appChecksum)
             {
                 qDebug() << "Need to download new version of application";
+                _setStatus("Downloading application");
                 m_protocol.sendCommand("APP?");
             }
             else
@@ -709,6 +736,7 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
     {
         qInfo().noquote() << "Application CONNECTED";
         KzServiceLink::instance()->setReady(true);
+        _setStatus("Connected");
 
         m_ready = true;
         emit readyChanged();
@@ -745,6 +773,7 @@ void KazaApplicationManager::_processFrameFile(const QString &fileid, QByteArray
     if(fileid == "APP")
     {
         qDebug() << "Create application " << m_appFile;
+        _setStatus("Installing application");
         QFile app(m_appFile);
         if(app.open(QIODevice::WriteOnly))
         {

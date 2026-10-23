@@ -27,6 +27,7 @@ class KazaApplicationManager : public QObject
     Q_PROPERTY(QString homepage READ homepage NOTIFY homepageChanged FINAL)
     Q_PROPERTY(bool show READ show WRITE setShow NOTIFY showChanged FINAL)
     Q_PROPERTY(QString errorMsg READ errorMsg WRITE setErrorMsg NOTIFY errorMsgChanged FINAL)
+    Q_PROPERTY(QString status READ status NOTIFY statusChanged FINAL)
 
     QSettings m_settings;
     QSslSocket m_ssl;
@@ -78,6 +79,7 @@ public:
     void setShow(bool newShow);
     QString errorMsg() const;
     void setErrorMsg(const QString &newErrorMsg);
+    QString status() const;
 
 public slots:
     bool setConfiguration(QString host, uint16_t port, QString adminPassword, QString username, QString userPassword);
@@ -106,12 +108,14 @@ signals:
     void applicationVersionsChanged();
     void currentApplicationChanged();
     void errorMsgChanged();
+    void statusChanged();
 
 private:
     bool _configureSslSocket(QSslSocket &ssl, const QString &clientCert, const QString &caCert, const QString &clientKey, const QString &clientPassword, const QString &host, uint16_t port);
     void __appStateChange(Qt::ApplicationState state);
     void _calculateAppChecksum();
     void _scheduleReconnect();
+    void _setStatus(const QString &newStatus);
 
     void _processFrameSystem(const QString &command);
     void _processFrameFile(const QString &fileid, QByteArray data);
@@ -120,6 +124,7 @@ private:
     QStringList m_applicationVersions;
     QString m_currentApplication;
     QString m_errorMsg;
+    QString m_status;
 };
 
 
