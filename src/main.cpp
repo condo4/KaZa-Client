@@ -8,6 +8,8 @@
 #include "kzobject.h"
 #include "kzhistory.h"
 #include "kzevolution.h"
+#include "kzrequest.h"
+#include "kztable.h"
 #include "kzport.h"
 #include <QtWebView>
 
@@ -55,6 +57,8 @@ int main(int argc, char *argv[])
     qmlRegisterType<KzObject>("org.kazoe.kaza", 1, 0, "KzObject");
     qmlRegisterType<KzHistory>("org.kazoe.kaza", 1, 0, "KzHistory");
     qmlRegisterType<KzEvolution>("org.kazoe.kaza", 1, 0, "KzEvolution");
+    qmlRegisterType<KzRequest>("org.kazoe.kaza", 1, 0, "KzRequest");
+    qmlRegisterType<KzTable>("org.kazoe.kaza", 1, 0, "KzTable");
     qmlRegisterType<KzPort>("org.kazoe.kaza", 1, 0, "KzPort");
     engine.rootContext()->setContextProperty("manager", &manager);
     engine.rootContext()->setContextProperty("knxiface", &manager); // For QML compatibility with KaZa 1.0

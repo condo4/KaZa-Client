@@ -20,6 +20,7 @@
 
 #include "kazaobject.h"
 #include "kazanotificationchecker.h"
+#include "kzservicelink.h"
 
 
 #ifdef ANDROID
@@ -46,6 +47,7 @@ KazaApplicationManager::KazaApplicationManager(QObject *parent)
     #endif
     QObject::connect(&m_ssl, &QSslSocket::encrypted, this, &KazaApplicationManager::_encrypted);
     QObject::connect(&m_protocol, &KaZaProtocol::disconnectFromHost, this, &KazaApplicationManager::_disconnected);
+    KzServiceLink::instance()->attach(&m_protocol);
 
     m_pingTimer.setInterval(25000);
     QObject::connect(&m_pingTimer, &QTimer::timeout, this, &KazaApplicationManager::_pingTimeout);
@@ -327,6 +329,8 @@ void KazaApplicationManager::_disconnected() {
     m_pingTimer.stop();
     m_pongPending = false;
 
+    KzServiceLink::instance()->setServicesAvailable(false);
+    KzServiceLink::instance()->setReady(false);
     if(m_secured) { m_secured = false; emit securedChanged(); }
     if(m_ready)   { m_ready = false; emit readyChanged(); }
     emit connectedChanged(false);
@@ -704,6 +708,7 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
     else if(command.startsWith("CONNECTED"))
     {
         qInfo().noquote() << "Application CONNECTED";
+        KzServiceLink::instance()->setReady(true);
 
         m_ready = true;
         emit readyChanged();
@@ -721,6 +726,10 @@ void KazaApplicationManager::_processFrameSystem(const QString &command)
                 m_protocol.sendCommand("OBJ:" + obj->name() + ":" + QString::number(m_instance->m_kobjects.indexOf(obj)));
             }
         }
+    }
+    else if(command.startsWith("CAPS:"))
+    {
+        KzServiceLink::instance()->handleCaps(command);
     }
     else if(command == "PONG")
     {

@@ -73,7 +73,7 @@ DbQuery::DbQuery(const QString &query, QObject *parent)
     QObject::connect(protocol, &KaZaProtocol::frameDbQueryResult, this, &DbQuery::_dbResult);
 }
 
-void DbQuery::_dbResult(uint8_t id, const QStringList &culumns, const QList<QList<QVariant> > &result)
+void DbQuery::_dbResult(uint32_t id, const QStringList &culumns, const QList<QList<QVariant> > &result)
 {
     if(id == m_id)
     {

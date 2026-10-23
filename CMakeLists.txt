@@ -43,6 +43,9 @@ qt_add_executable(KaZa
     src/kzobject.h                  src/kzobject.cpp
     src/kzhistory.h                 src/kzhistory.cpp
     src/kzevolution.h               src/kzevolution.cpp
+    src/kzrequest.h                 src/kzrequest.cpp
+    src/kztable.h                   src/kztable.cpp
+    src/kzservicelink.h             src/kzservicelink.cpp
     src/kazaobject.h                src/kazaobject.cpp
     src/dbquery.h                   src/dbquery.cpp
     src/kzport.h                    src/kzport.cpp

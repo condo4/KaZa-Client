@@ -32,7 +32,7 @@ public:
     qsizetype columnCount();
 
 private slots:
-    void _dbResult(uint8_t id, const QStringList &culumns, const QList<QList<QVariant>> &result);
+    void _dbResult(uint32_t id, const QStringList &culumns, const QList<QList<QVariant>> &result);
 
 signals:
     void completed();

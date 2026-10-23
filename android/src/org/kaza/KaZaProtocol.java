@@ -30,6 +30,12 @@ public class KaZaProtocol {
     public static final byte FRAME_SOCKET_CONNECT = 5;
     public static final byte FRAME_SOCKET_DATA = 6;
     public static final byte FRAME_SOCKET_STATE = 7;
+    public static final byte FRAME_OBJLIST = 8;
+    public static final byte FRAME_HISTORY = 9;
+    public static final byte FRAME_HISTORYRESULT = 10;
+    public static final byte FRAME_REQUEST = 11;
+    public static final byte FRAME_RESPONSE = 12;
+    public static final byte FRAME_CANCEL = 13;
     public static final byte FRAME_VERSION = (byte) 255;
 
     // Protocol version constants
