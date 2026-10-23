@@ -9,7 +9,8 @@ set(VERSION_CODE 2610151)
 add_definitions("-DVERSION_CODE=${VERSION_CODE}")
 add_definitions("-DVERSION_NAME=${CMAKE_PROJECT_VERSION}")
 
-find_package(Qt6 REQUIRED COMPONENTS CorePrivate Quick QuickControls2 Network Xml WebView Positioning Location)
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Network Xml WebView Positioning Location
+             OPTIONAL_COMPONENTS CorePrivate)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -79,8 +80,15 @@ set_source_files_properties(qml/ForceInstall.qml PROPERTIES QT_QML_SKIP_CACHEGEN
 target_include_directories(KaZa PUBLIC protocol/)
 
 target_link_libraries(KaZa
-    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Xml Qt6::CorePrivate Qt6::WebView Qt6::Positioning Qt6::Location
+    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::Xml Qt6::WebView Qt6::Positioning Qt6::Location
 )
+
+# CorePrivate is only needed for QtCore/private/qandroidextras_p.h, depending on the Qt version
+if(TARGET Qt6::CorePrivate)
+    target_link_libraries(KaZa PRIVATE Qt6::CorePrivate)
+elseif(ANDROID)
+    message(WARNING "Qt6::CorePrivate not found, qandroidextras_p.h may be unavailable")
+endif()
 
 if (ANDROID)
     message(STATUS "Build for ANDROID")
